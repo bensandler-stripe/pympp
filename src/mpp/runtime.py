@@ -32,16 +32,20 @@ class PaymentRuntime:
         events: EventDispatcher | None = None,
     ) -> None:
         self.methods = tuple(methods)
-        self._methods = {method.name: method for method in self.methods}
+        self._methods: dict[tuple[str, str], Method] = {}
+        for method in self.methods:
+            intents = getattr(method, "intents", ("charge",))
+            for intent in intents:
+                self._methods[(method.name, intent)] = method
         self.events = events if events is not None else EventDispatcher()
 
     def match_challenge(
         self,
         challenges: Sequence[Challenge],
     ) -> tuple[Challenge, Method]:
-        """Return the first challenge with a configured payment method."""
+        """Return the first challenge with a configured method and intent."""
         for challenge in challenges:
-            method = self._methods.get(challenge.method)
+            method = self._methods.get((challenge.method, challenge.intent))
             if method is not None:
                 return challenge, method
 
