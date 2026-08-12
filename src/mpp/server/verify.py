@@ -18,20 +18,23 @@ from mpp._units import transform_units
 from mpp.errors import (
     InvalidChallengeError,
     MalformedCredentialError,
+    PaymentError,
     PaymentExpiredError,
+    PaymentOutcomeUnknownError,
 )
 from mpp.events import CHALLENGE_CREATED, PAYMENT_FAILED, PAYMENT_SUCCESS, EventDispatcher
+from mpp.server.intent import broadcast_credential
 
 DEFAULT_EXPIRES_MINUTES = 5
 
 if TYPE_CHECKING:
-    from mpp.server.intent import Intent
+    from mpp.server.intent import Intent, VerifiableIntent
 
 
 async def verify_or_challenge(
     *,
     authorization: str | None,
-    intent: Intent,
+    intent: Intent | VerifiableIntent,
     request: dict[str, Any],
     realm: str,
     secret_key: str,
@@ -121,6 +124,14 @@ async def verify_or_challenge(
         # Preserve the existing challenge-on-failure flow while giving hooks a
         # typed reason for why the submitted credential was rejected.
         challenge = await new_challenge()
+        await emit_failure(error, challenge, credential)
+        return challenge
+
+    async def emit_failure(
+        error: Exception,
+        challenge: Challenge,
+        credential: Credential | None = None,
+    ) -> None:
         if events is not None:
             await events.emit(
                 PAYMENT_FAILED,
@@ -133,7 +144,6 @@ async def verify_or_challenge(
                     "request": request,
                 },
             )
-        return challenge
 
     if authorization is None:
         return await new_challenge()
@@ -151,26 +161,9 @@ async def verify_or_challenge(
     # echoed parameters and compare to the credential's challenge ID.
     echo = credential.challenge
     try:
-        echo_request = _b64_decode(echo.request) if echo.request else {}
-        echo_opaque = _b64_decode(echo.opaque) if echo.opaque else None
-    except ParseError as error:
-        return await fail(MalformedCredentialError(str(error)), credential)
-
-    expected_id = generate_challenge_id(
-        secret_key=secret_key,
-        realm=echo.realm,
-        method=echo.method,
-        intent=echo.intent,
-        request=echo_request,
-        expires=echo.expires,
-        digest=echo.digest,
-        opaque=echo_opaque,
-    )
-    if not _constant_time_equal(echo.id, expected_id):
-        return await fail(
-            InvalidChallengeError(echo.id, "challenge was not issued by this server"),
-            credential,
-        )
+        echo_request, echo_opaque = _authenticate_echo(credential, secret_key=secret_key)
+    except (MalformedCredentialError, InvalidChallengeError) as error:
+        return await fail(error, credential)
 
     # Reject credentials minted for a different realm, method, or intent.
     # This still returns a new Challenge; the only new behavior is the
@@ -209,28 +202,29 @@ async def verify_or_challenge(
     if expires_dt < datetime.now(UTC):
         return await fail(PaymentExpiredError(echo.expires), credential)
 
+    submitted_challenge = _challenge_from_echo(echo, echo_request, echo_opaque)
     try:
-        receipt: Receipt = await intent.verify(credential, request)
+        receipt = await broadcast_credential(
+            intent=intent,
+            credential=credential,
+            request=request,
+        )
+    except PaymentOutcomeUnknownError as error:
+        await emit_failure(error, submitted_challenge, credential)
+        raise
+    except PaymentError as error:
+        error.retry_challenge = await new_challenge()
+        await emit_failure(error, submitted_challenge, credential)
+        raise
     except Exception as error:
-        if events is not None:
-            await events.emit(
-                PAYMENT_FAILED,
-                {
-                    "challenge": _challenge_from_echo(echo, echo_request, echo_opaque),
-                    "credential": credential,
-                    "error": error,
-                    "intent": intent.name,
-                    "method": method_name,
-                    "request": request,
-                },
-            )
+        await emit_failure(error, submitted_challenge, credential)
         raise
 
     if events is not None:
         await events.emit(
             PAYMENT_SUCCESS,
             {
-                "challenge": _challenge_from_echo(echo, echo_request, echo_opaque),
+                "challenge": submitted_challenge,
                 "credential": credential,
                 "intent": intent.name,
                 "method": method_name,
@@ -240,6 +234,45 @@ async def verify_or_challenge(
         )
 
     return (credential, receipt)
+
+
+def _authenticate_echo(
+    credential: Credential,
+    *,
+    secret_key: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Authenticate a credential's echoed challenge against the server secret.
+
+    Decodes the echoed request/opaque, recomputes the HMAC-bound challenge ID,
+    and compares it in constant time.
+
+    Returns:
+        The decoded (request, opaque) echoed by the credential.
+
+    Raises:
+        MalformedCredentialError: If the echoed parameters cannot be decoded.
+        InvalidChallengeError: If the challenge ID was not issued by this server.
+    """
+    echo = credential.challenge
+    try:
+        echo_request = _b64_decode(echo.request) if echo.request else {}
+        echo_opaque = _b64_decode(echo.opaque) if echo.opaque else None
+    except ParseError as error:
+        raise MalformedCredentialError(str(error)) from error
+
+    expected_id = generate_challenge_id(
+        secret_key=secret_key,
+        realm=echo.realm,
+        method=echo.method,
+        intent=echo.intent,
+        request=echo_request,
+        expires=echo.expires,
+        digest=echo.digest,
+        opaque=echo_opaque,
+    )
+    if not _constant_time_equal(echo.id, expected_id):
+        raise InvalidChallengeError(echo.id, "challenge was not issued by this server")
+    return echo_request, echo_opaque
 
 
 def _create_challenge(

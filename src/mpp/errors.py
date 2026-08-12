@@ -46,6 +46,11 @@ class PaymentError(Exception):
     status: int = 402
     title: str = "Payment Error"
     hint: str | None = None
+    details: dict[str, Any] | None = None
+    """Machine-readable details safe to expose in problem details output."""
+    retry_challenge: Any | None = None
+    """Fresh :class:`~mpp.Challenge` attached by the server verification flow
+    when payment fails, so transports can return a retryable 402 response."""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -68,6 +73,8 @@ class PaymentError(Exception):
             details["challengeId"] = challenge_id
         if self.hint is not None:
             details["hint"] = self.hint
+        if self.details is not None:
+            details["details"] = self.details
         return details
 
 
@@ -128,11 +135,17 @@ class InvalidChallengeError(PaymentError):
 class VerificationFailedError(PaymentError):
     """Payment proof is invalid or verification failed."""
 
-    def __init__(self, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        reason: str | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         msg = (
             f"Payment verification failed: {reason}." if reason else "Payment verification failed."
         )
         super().__init__(msg)
+        self.details = details
 
 
 class PaymentExpiredError(PaymentError):

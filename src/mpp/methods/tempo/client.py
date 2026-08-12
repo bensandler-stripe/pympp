@@ -22,8 +22,11 @@ from mpp.methods.tempo._rpc import _rpc_call, estimate_gas
 from mpp.methods.tempo.fee_payer_policy import get_policy
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from mpp.methods.tempo.account import TempoAccount
-    from mpp.server.intent import Intent
+    from mpp.methods.tempo.relay import Relay
+    from mpp.server.intent import Intent, VerifiableIntent
 
 
 # Tempo AA (type-0x76) transactions have higher intrinsic gas than legacy txs
@@ -74,14 +77,14 @@ class TempoMethod:
     recipient: str | None = None
     decimals: int = 6
     client_id: str | None = None
-    _intents: dict[str, Intent] = field(default_factory=dict)
+    _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
     _cached_chain_ids: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _chain_id_explicit: bool = field(default=False, init=False, repr=False)
     _chain_id_lock: asyncio.Lock | None = field(default=None, init=False, repr=False)
     _rpc_url_explicit: bool = field(default=False, init=False, repr=False)
 
     @property
-    def intents(self) -> dict[str, Intent]:
+    def intents(self) -> dict[str, Intent | VerifiableIntent]:
         """Available intents for this method."""
         return self._intents
 
@@ -383,7 +386,7 @@ class TempoMethod:
 
 
 def tempo(
-    intents: dict[str, Intent],
+    intents: Mapping[str, Intent | VerifiableIntent],
     account: TempoAccount | None = None,
     fee_payer: TempoAccount | None = None,
     chain_id: int | None | object = _CHAIN_ID_UNSET,
@@ -393,6 +396,7 @@ def tempo(
     recipient: str | None = None,
     decimals: int = 6,
     client_id: str | None = None,
+    relay: Relay | None = None,
 ) -> TempoMethod:
     """Create a Tempo payment method.
 
@@ -414,6 +418,7 @@ def tempo(
         recipient: Default recipient address for charges.
         decimals: Token decimal places for amount conversion (default: 6).
         client_id: Optional client identity for attribution memos.
+        relay: Optional server-side Tempo API relay for the charge intent.
 
     Returns:
         A configured TempoMethod instance.
@@ -468,5 +473,11 @@ def tempo(
             intent.rpc_url = rpc_url  # type: ignore[union-attr]
         if hasattr(intent, "_method"):
             intent._method = method  # type: ignore[union-attr]
-    method._intents = dict(intents)
+    configured_intents = dict(intents)
+    if relay is not None:
+        charge = configured_intents.get("charge")
+        if charge is None:
+            raise ValueError("relay requires a charge intent")
+        configured_intents["charge"] = relay.configure(charge)
+    method._intents = configured_intents
     return method

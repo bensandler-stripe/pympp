@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from mpp import Challenge, Credential, Receipt
-from mpp._units import parse_units
+from mpp._parsing import ParseError, _b64_decode, _parse_timestamp
+from mpp._units import parse_units, transform_units
+from mpp.errors import (
+    InvalidChallengeError,
+    MalformedCredentialError,
+    PaymentExpiredError,
+    PaymentMethodUnsupportedError,
+)
 from mpp.events import (
     CHALLENGE_CREATED,
     PAYMENT_FAILED,
@@ -23,16 +30,33 @@ from mpp.server.decorator import (
     resolve_body_param,
     wrap_payment_handler,
 )
+from mpp.server.intent import Validation
+from mpp.server.intent import broadcast_credential as broadcast_intent_credential
+from mpp.server.intent import validate_credential as validate_intent_credential
 from mpp.server.method import transform_request
-from mpp.server.verify import verify_or_challenge
+from mpp.server.verify import (
+    _authenticate_echo,
+    _body_digest_error,
+    _challenge_from_echo,
+    verify_or_challenge,
+)
 from mpp.store import Store
 
 if TYPE_CHECKING:
+    from mpp.server.intent import Intent, VerifiableIntent
     from mpp.server.method import Method
 
 R = TypeVar("R")
 
 DEFAULT_DECIMALS = 6
+
+
+class _ContextUnset:
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_CONTEXT_UNSET: Any = _ContextUnset()
 
 
 class Mpp:
@@ -114,11 +138,219 @@ class Mpp:
     def _wire_store(self, store: Store) -> None:
         """Inject *store* into intents that have a ``_store`` attribute set to None."""
         intents = getattr(self.method, "intents", None)
-        if not isinstance(intents, dict):
+        if not isinstance(intents, Mapping):
             return
         for intent_obj in intents.values():
             if hasattr(intent_obj, "_store") and intent_obj._store is None:
                 intent_obj._store = store
+
+    def _prepare_credential(
+        self,
+        value: Credential | str,
+        *,
+        intent: str | None,
+        request: dict[str, Any] | None,
+        meta: dict[str, str] | None = _CONTEXT_UNSET,
+        body: str | bytes | dict[str, Any] | None = _CONTEXT_UNSET,
+    ) -> tuple[Credential, Intent | VerifiableIntent, dict[str, Any], Challenge]:
+        """Authenticate and resolve a credential outside an HTTP route."""
+        credential = self._parse_credential(value)
+
+        echo = credential.challenge
+        echoed_request, echoed_opaque = _authenticate_echo(
+            credential,
+            secret_key=self.secret_key,
+        )
+
+        if echo.realm != self.realm:
+            raise InvalidChallengeError(echo.id, "credential realm does not match")
+        if echo.method != self.method.name:
+            raise PaymentMethodUnsupportedError(echo.method)
+        if intent is not None and echo.intent != intent:
+            raise InvalidChallengeError(echo.id, "credential intent does not match")
+
+        if not echo.expires:
+            raise PaymentExpiredError(echo.expires)
+        try:
+            expires = _parse_timestamp(echo.expires)
+        except ParseError as error:
+            raise PaymentExpiredError(echo.expires) from error
+        if expires.tzinfo is None or expires < datetime.now(UTC):
+            raise PaymentExpiredError(echo.expires)
+
+        if request is not None:
+            expected_request = transform_request(
+                self.method,
+                transform_units(request),
+                credential,
+            )
+            if expected_request != echoed_request:
+                raise InvalidChallengeError(echo.id, "credential request does not match")
+
+        if request is not None or meta is not _CONTEXT_UNSET or body is not _CONTEXT_UNSET:
+            expected_meta = None if meta is _CONTEXT_UNSET else meta
+            expected_body = None if body is _CONTEXT_UNSET else body
+            if echoed_opaque != expected_meta:
+                raise InvalidChallengeError(echo.id, "credential opaque does not match")
+            if digest_error := _body_digest_error(echo.digest, expected_body):
+                raise InvalidChallengeError(echo.id, digest_error)
+
+        intent_obj = self.method.intents.get(echo.intent)
+        if intent_obj is None:
+            raise PaymentMethodUnsupportedError(f"{echo.method}/{echo.intent}")
+        challenge = _challenge_from_echo(echo, echoed_request, echoed_opaque)
+        return credential, intent_obj, echoed_request, challenge
+
+    @staticmethod
+    def _parse_credential(value: Credential | str) -> Credential:
+        if isinstance(value, Credential):
+            return value
+        authorization = value if value.lower().startswith("payment ") else f"Payment {value}"
+        try:
+            return Credential.from_authorization(authorization)
+        except ParseError as error:
+            raise MalformedCredentialError(str(error)) from error
+
+    async def validate_credential(
+        self,
+        credential: Credential | str,
+        *,
+        intent: str | None = None,
+        request: dict[str, Any] | None = None,
+        meta: dict[str, str] | None = _CONTEXT_UNSET,
+        body: str | bytes | dict[str, Any] | None = _CONTEXT_UNSET,
+    ) -> Validation:
+        """Validate a bound credential without consuming payment state.
+
+        Authenticates the credential's echoed challenge against this server's
+        secret key (HMAC challenge ID, realm, method, expiry) before running
+        the intent's non-mutating ``validate`` hook. The result is advisory —
+        it confirms the credential is currently acceptable but does not
+        settle, reserve, or consume the payment — so no payment events are
+        emitted.
+
+        Args:
+            credential: A parsed ``Credential`` or its serialized form (the
+                ``Authorization`` header value, with or without the
+                ``Payment`` scheme prefix).
+            intent: If provided, also require the credential to be bound to
+                this intent name.
+            request: If provided, also require the credential's echoed
+                request to match these request parameters.
+            meta: Expected opaque challenge metadata. Supplying any request,
+                meta, or body context checks all three bindings; omitted
+                bindings are treated as absent.
+            body: Expected request body for the challenge's digest binding.
+
+        Returns:
+            The intent's validation record for the accepted credential.
+
+        Raises:
+            MalformedCredentialError: If the credential cannot be parsed.
+            InvalidChallengeError: If the challenge was not issued by this
+                server or does not match the requested binding.
+            PaymentExpiredError: If the echoed challenge has expired.
+            PaymentMethodUnsupportedError: If the credential names a method
+                or intent this server does not serve.
+            VerificationFailedError: If the intent does not support
+                non-mutating validation or rejects the credential.
+        """
+        prepared, intent_obj, echoed_request, _ = self._prepare_credential(
+            credential,
+            intent=intent,
+            request=request,
+            meta=meta,
+            body=body,
+        )
+        return await validate_intent_credential(
+            intent=intent_obj,
+            credential=prepared,
+            request=echoed_request,
+        )
+
+    async def broadcast_credential(
+        self,
+        credential: Credential | str,
+        *,
+        intent: str | None = None,
+        request: dict[str, Any] | None = None,
+        meta: dict[str, str] | None = _CONTEXT_UNSET,
+        body: str | bytes | dict[str, Any] | None = _CONTEXT_UNSET,
+    ) -> Receipt:
+        """Revalidate and perform a bound credential's terminal operation.
+
+        Applies the same challenge authentication as
+        :meth:`validate_credential`, then runs the intent's validate-then-broadcast
+        lifecycle — the non-mutating ``validate`` hook followed by the terminal
+        ``broadcast`` (legacy intents fall back to their combined ``verify``
+        hook). Emits the same payment success/failure events as HTTP route
+        handlers.
+
+        Args:
+            credential: A parsed ``Credential`` or its serialized form.
+            intent: If provided, also require the credential to be bound to
+                this intent name.
+            request: If provided, also require the credential's echoed
+                request to match these request parameters.
+            meta: Expected opaque challenge metadata. Supplying any request,
+                meta, or body context checks all three bindings; omitted
+                bindings are treated as absent.
+            body: Expected request body for the challenge's digest binding.
+
+        Returns:
+            The settlement receipt from the intent's terminal operation.
+
+        Raises:
+            The same challenge-authentication errors as
+            :meth:`validate_credential`, or the intent's verification error
+            if validation or settlement fails.
+        """
+        parsed = self._parse_credential(credential)
+        try:
+            prepared, intent_obj, echoed_request, challenge = self._prepare_credential(
+                parsed,
+                intent=intent,
+                request=request,
+                meta=meta,
+                body=body,
+            )
+        except Exception as error:
+            echo = parsed.challenge
+            try:
+                decoded_request = _b64_decode(echo.request) if echo.request else {}
+            except ParseError:
+                decoded_request = {}
+            failed_request = decoded_request if isinstance(decoded_request, dict) else {}
+            await self._events.emit(
+                PAYMENT_FAILED,
+                {
+                    "challenge": _challenge_from_echo(echo, failed_request, None),
+                    "credential": parsed,
+                    "error": error,
+                    "intent": intent or echo.intent,
+                    "method": self.method.name,
+                    "request": failed_request,
+                },
+            )
+            raise
+        context = {
+            "challenge": challenge,
+            "credential": prepared,
+            "intent": intent_obj.name,
+            "method": self.method.name,
+            "request": echoed_request,
+        }
+        try:
+            receipt = await broadcast_intent_credential(
+                intent=intent_obj,
+                credential=prepared,
+                request=echoed_request,
+            )
+        except Exception as error:
+            await self._events.emit(PAYMENT_FAILED, {**context, "error": error})
+            raise
+        await self._events.emit(PAYMENT_SUCCESS, {**context, "receipt": receipt})
+        return receipt
 
     @classmethod
     def create(

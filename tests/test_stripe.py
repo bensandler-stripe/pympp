@@ -186,7 +186,7 @@ class TestStripeMethod:
 
     @pytest.mark.asyncio
     async def test_create_credential_missing_network_id_raises(self):
-        """networkId is required in challenge.methodDetails (mppx parity)."""
+        """networkId is required in challenge.methodDetails."""
 
         async def fake_create_token(params: OnChallengeParameters) -> str:
             return "spt_test_abc"
@@ -235,7 +235,7 @@ class TestStripeMethod:
 
     @pytest.mark.asyncio
     async def test_create_credential_rejects_metadata_external_id(self):
-        """metadata.externalId is reserved (mppx parity)."""
+        """metadata.externalId is reserved."""
 
         async def fake_create_token(params: OnChallengeParameters) -> str:
             return "spt_test_abc"

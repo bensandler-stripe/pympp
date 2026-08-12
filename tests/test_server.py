@@ -3,10 +3,11 @@
 import pytest
 
 from mpp import BodyDigest, Challenge, Credential, Receipt
+from mpp.errors import VerificationFailedError
 from mpp.events import EventDispatcher
 from mpp.server import Mpp, intent, pay, verify_or_challenge
 from mpp.server.intent import VerificationError
-from tests import make_bound_credential, make_credential
+from tests import MockRequest, challenge_from_402, make_bound_credential, make_credential
 
 try:
     from starlette.responses import Response as StarletteResponse
@@ -452,6 +453,42 @@ class TestVerificationError:
         assert events == [f"failed:{credential.challenge.id}:VerificationError"]
 
     @pytest.mark.asyncio
+    async def test_payment_error_event_uses_submitted_challenge(self) -> None:
+        """Payment failures should identify the attempted, not retry, challenge."""
+        failed_challenge_ids: list[str] = []
+        dispatcher = EventDispatcher()
+        dispatcher.on(
+            "payment.failed",
+            lambda payload: failed_challenge_ids.append(payload["challenge"].id),
+        )
+
+        @intent(name="charge")
+        async def failing_intent(credential: Credential, request: dict) -> Receipt:
+            raise VerificationFailedError("Payment verification failed")
+
+        credential = make_bound_credential(
+            payload={},
+            request={"amount": "1000"},
+            realm="api.example.com",
+            secret_key="test-secret",
+        )
+
+        with pytest.raises(VerificationFailedError) as raised:
+            await verify_or_challenge(
+                authorization=credential.to_authorization(),
+                intent=failing_intent,
+                request={"amount": "1000"},
+                realm="api.example.com",
+                secret_key="test-secret",
+                events=dispatcher,
+            )
+
+        retry = raised.value.retry_challenge
+        assert isinstance(retry, Challenge)
+        assert failed_challenge_ids == [credential.challenge.id]
+        assert retry.id != credential.challenge.id
+
+    @pytest.mark.asyncio
     async def test_returns_receipt_for_success(self) -> None:
         """Successful receipts should be returned normally."""
 
@@ -633,37 +670,11 @@ class TestCrossEndpointReplay:
         assert result.intent == "charge"
 
 
-class MockRequest:
-    """Mock request object for testing."""
-
-    def __init__(
-        self,
-        authorization: str | None = None,
-        body: bytes | None = None,
-        path: str | None = None,
-        route: str | None = None,
-        query_string: str | None = None,
-    ) -> None:
-        self.headers = {"authorization": authorization} if authorization else {}
-        self.body = body
-        if path is not None:
-            self.path = path
-        if route is not None:
-            self.route = route
-        if query_string is not None:
-            self.query_string = query_string
-
-
 class DjangoStyleRequest:
     """Mock Django-style request object for testing."""
 
     def __init__(self, authorization: str | None = None) -> None:
         self.META = {"HTTP_AUTHORIZATION": authorization} if authorization else {}
-
-
-def challenge_from_402(result) -> Challenge:
-    headers = result.headers if HAS_STARLETTE else result["headers"]
-    return Challenge.from_www_authenticate(headers["WWW-Authenticate"])
 
 
 class TestWrapPaymentHandler:
@@ -1180,7 +1191,7 @@ class TestMppPay:
 
     @pytest.mark.asyncio
     async def test_exposes_server_event_helpers(self) -> None:
-        """Mpp should expose mppx-compatible server event helper methods."""
+        """Mpp should expose challenge and payment event helpers."""
         events: list[str] = []
 
         @intent(name="charge")

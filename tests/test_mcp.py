@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from mpp import Challenge, Credential, Receipt, generate_challenge_id
+from mpp.errors import PaymentOutcomeUnknownError, VerificationFailedError
 from mpp.extensions.mcp import (
     CODE_MALFORMED_CREDENTIAL,
     CODE_PAYMENT_REQUIRED,
@@ -24,6 +25,7 @@ from mpp.extensions.mcp import (
     payment_capabilities,
     verify_or_challenge,
 )
+from mpp.server import Validation
 from tests import TEST_SECRET
 
 MCP_TEST_SECRET = TEST_SECRET
@@ -734,6 +736,74 @@ class TestVerifyOrChallenge:
             )
 
         assert exc_info.value.detail == "Payment failed"
+
+    async def test_maps_verifiable_payment_error_to_mcp_verification_error(self) -> None:
+        class VerifiableIntent:
+            name = "charge"
+
+            async def validate(self, credential: object, request: dict) -> object:
+                raise VerificationFailedError(
+                    details={"code": "insufficient_funds"},
+                )
+
+            async def broadcast(self, credential: object, request: dict) -> Receipt:
+                raise AssertionError("broadcast must not run after failed validation")
+
+        challenge = _make_bound_mcp_challenge(request={"amount": "1000"})
+        mcp_credential = MCPCredential(
+            challenge=challenge,
+            payload={"type": "transaction", "signature": "0x1234"},
+        )
+
+        with pytest.raises(PaymentVerificationError) as exc_info:
+            await verify_or_challenge(
+                meta=mcp_credential.to_meta(),
+                intent=VerifiableIntent(),  # type: ignore[arg-type]
+                request={"amount": "1000"},
+                realm="api.example.com",
+                secret_key=MCP_TEST_SECRET,
+            )
+
+        error = exc_info.value.to_jsonrpc_error()
+        retry = error["data"]["challenges"][0]
+        assert error["code"] == CODE_PAYMENT_VERIFICATION_FAILED
+        assert error["data"]["httpStatus"] == 402
+        assert retry["id"] != challenge.id
+        assert error["data"]["failure"] == {
+            "reason": "verification-failed",
+            "detail": "Payment verification failed.",
+            "details": {"code": "insufficient_funds"},
+        }
+
+    async def test_preserves_unknown_payment_outcome_without_fresh_challenge(self) -> None:
+        class VerifiableIntent:
+            name = "charge"
+
+            async def validate(self, credential: Credential, request: dict) -> object:
+                return Validation(
+                    credential=credential,
+                    details={},
+                    intent=self.name,
+                    request=request,
+                )
+
+            async def broadcast(self, credential: Credential, request: dict) -> Receipt:
+                raise PaymentOutcomeUnknownError(credential.challenge, RuntimeError("lost"))
+
+        challenge = _make_bound_mcp_challenge(request={"amount": "1000"})
+        mcp_credential = MCPCredential(
+            challenge=challenge,
+            payload={"type": "transaction", "signature": "0x1234"},
+        )
+
+        with pytest.raises(PaymentOutcomeUnknownError):
+            await verify_or_challenge(
+                meta=mcp_credential.to_meta(),
+                intent=VerifiableIntent(),  # type: ignore[arg-type]
+                request={"amount": "1000"},
+                realm="api.example.com",
+                secret_key=MCP_TEST_SECRET,
+            )
 
     async def test_rejects_credential_with_wrong_realm(self) -> None:
         """Credential issued for realm-A should be rejected at realm-B."""
