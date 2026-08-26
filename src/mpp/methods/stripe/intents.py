@@ -81,6 +81,8 @@ class ChargeIntent:
         secret_key: str | None = None,
         http_client: Any | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        include_analytics: bool = True,
+        stripe_version: str | None = None,
     ) -> None:
         """Initialize the charge intent.
 
@@ -93,6 +95,9 @@ class ChargeIntent:
             http_client: Optional httpx client for raw HTTP calls.
                 If provided, the caller is responsible for closing it.
             timeout: Request timeout in seconds (default: 30).
+            include_analytics: Whether to add MPP analytics to PaymentIntent metadata.
+                Defaults to ``True`` for backwards compatibility.
+            stripe_version: Optional Stripe API version for SDK requests.
 
         Raises:
             ValueError: If neither ``client`` nor ``secret_key`` is provided.
@@ -104,6 +109,8 @@ class ChargeIntent:
         self._http_client = http_client
         self._owns_client = http_client is None
         self._timeout = timeout
+        self._include_analytics = include_analytics
+        self._stripe_version = stripe_version
 
     async def __aenter__(self) -> ChargeIntent:
         """Enter async context, creating HTTP client if needed."""
@@ -174,7 +181,10 @@ class ChargeIntent:
         spt = parsed.spt
 
         user_metadata = parsed_request.methodDetails.metadata
-        resolved_metadata = {**_build_analytics(credential), **(user_metadata or {})}
+        resolved_metadata = {
+            **(_build_analytics(credential) if self._include_analytics else {}),
+            **(user_metadata or {}),
+        }
 
         if self._client is not None:
             pi = await self._create_with_client(
@@ -224,6 +234,8 @@ class ChargeIntent:
                 "shared_payment_granted_token": spt,
             }
             options = {"idempotency_key": f"mpp_{challenge_id}_{spt}"}
+            if self._stripe_version is not None:
+                options["stripe_version"] = self._stripe_version
 
             create_async = getattr(payment_intents, "create_async", None)
             if callable(create_async):

@@ -38,4 +38,6 @@ Example:
 
 from mpp.methods.stripe.client import StripeMethod, stripe
 from mpp.methods.stripe.intents import ChargeIntent
+from mpp.methods.stripe.machine_payments import MachinePayments as MachinePayments
+from mpp.methods.stripe.machine_payments import create as create
 from mpp.methods.stripe.schemas import ChargeRequest, StripeCredentialPayload

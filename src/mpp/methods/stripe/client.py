@@ -69,6 +69,7 @@ class StripeMethod:
     recipient: str | None = None
     network_id: str | None = None
     payment_method_types: list[str] = field(default_factory=lambda: ["card"])
+    metadata: dict[str, str] | None = field(default=None, kw_only=True)
     can_offer: CanOfferFn | None = field(default=None, kw_only=True)
     on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
@@ -99,6 +100,8 @@ class StripeMethod:
                 )
         if self.payment_method_types:
             method_details["paymentMethodTypes"] = self.payment_method_types
+        if self.metadata is not None:
+            method_details["metadata"] = dict(self.metadata)
         request = {**request, "methodDetails": method_details}
         if self.external_id and "externalId" not in request:
             request["externalId"] = self.external_id
@@ -201,6 +204,8 @@ def stripe(
     payment_method_types: list[str] | None = None,
     can_offer: CanOfferFn | None = None,
     on_payment_success: PaymentSuccessHandler | None = None,
+    *,
+    metadata: dict[str, str] | None = None,
 ) -> StripeMethod:
     """Create a Stripe payment method.
 
@@ -219,6 +224,7 @@ def stripe(
             challenge ``methodDetails.networkId``.
         payment_method_types: Stripe payment method types (default: ``["card"]``).
             Included in challenge ``methodDetails.paymentMethodTypes``.
+        metadata: Optional Stripe metadata included in the challenge request.
         can_offer: Optional callback that determines whether to advertise this method.
         on_payment_success: Optional callback invoked after successful verification.
 
@@ -253,6 +259,7 @@ def stripe(
         recipient=recipient,
         network_id=network_id,
         payment_method_types=payment_method_types or ["card"],
+        metadata=metadata,
         can_offer=can_offer,
         on_payment_success=on_payment_success,
     )
