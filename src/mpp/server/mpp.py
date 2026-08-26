@@ -34,7 +34,7 @@ from mpp.server.decorator import (
 from mpp.server.intent import Validation
 from mpp.server.intent import broadcast_credential as broadcast_intent_credential
 from mpp.server.intent import validate_credential as validate_intent_credential
-from mpp.server.method import transform_request
+from mpp.server.method import _SupportsPaymentSuccess, transform_request
 from mpp.server.verify import (
     _authenticate_echo,
     _body_digest_error,
@@ -44,6 +44,7 @@ from mpp.server.verify import (
 from mpp.store import Store
 
 if TYPE_CHECKING:
+    from mpp.events import ServerPaymentSuccessPayload
     from mpp.server.intent import Intent, VerifiableIntent
     from mpp.server.method import Method
 
@@ -117,6 +118,7 @@ class Mpp:
         self.secret_key = secret_key
         self.defaults = defaults or {}
         self._events = EventDispatcher()
+        self._register_method_payment_success_handler(method)
 
         if store is not None:
             self._wire_store(store)
@@ -146,6 +148,21 @@ class Mpp:
             for intent_obj in intents.values():
                 if hasattr(intent_obj, "_store") and intent_obj._store is None:
                     intent_obj._store = store
+
+    def _register_method_payment_success_handler(self, method: Method) -> None:
+        """Forward successful payments to a method's optional callback."""
+        handler = method.on_payment_success if isinstance(method, _SupportsPaymentSuccess) else None
+        if handler is None:
+            return
+        if not callable(handler):
+            raise ValueError("on_payment_success must be callable")
+
+        def dispatch(payload: ServerPaymentSuccessPayload) -> Any:
+            if payload["method"] == method.name:
+                return handler(payload)
+            return None
+
+        self._events.on(PAYMENT_SUCCESS, dispatch)
 
     def _prepare_credential(
         self,
@@ -426,6 +443,8 @@ class Mpp:
             server.methods = configured
             if store is not None:
                 server._wire_store(store)
+            for configured_method in configured[1:]:
+                server._register_method_payment_success_handler(configured_method)
         return server
 
     def compose(

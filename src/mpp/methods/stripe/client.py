@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from mpp import Challenge, Credential
+from mpp.methods import CanOfferFn, PaymentSuccessHandler
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -67,6 +68,8 @@ class StripeMethod:
     network_id: str | None = None
     payment_method_types: list[str] = field(default_factory=lambda: ["card"])
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
+    can_offer: CanOfferFn | None = field(default=None, kw_only=True)
+    on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
 
     @property
     def intents(self) -> dict[str, Intent | VerifiableIntent]:
@@ -194,6 +197,8 @@ def stripe(
     recipient: str | None = None,
     network_id: str | None = None,
     payment_method_types: list[str] | None = None,
+    can_offer: CanOfferFn | None = None,
+    on_payment_success: PaymentSuccessHandler | None = None,
 ) -> StripeMethod:
     """Create a Stripe payment method.
 
@@ -212,6 +217,8 @@ def stripe(
             challenge ``methodDetails.networkId``.
         payment_method_types: Stripe payment method types (default: ``["card"]``).
             Included in challenge ``methodDetails.paymentMethodTypes``.
+        can_offer: Optional callback that filters this method's composed offers.
+        on_payment_success: Optional callback invoked after successful verification.
 
     Returns:
         A configured :class:`StripeMethod` instance.
@@ -244,6 +251,8 @@ def stripe(
         recipient=recipient,
         network_id=network_id,
         payment_method_types=payment_method_types or ["card"],
+        can_offer=can_offer,
+        on_payment_success=on_payment_success,
     )
     method._intents = dict(intents)
     return method

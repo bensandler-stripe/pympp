@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from mpp import Challenge, Credential
+from mpp.methods import CanOfferFn, PaymentSuccessHandler
 from mpp.methods.tempo._attribution import encode as encode_attribution
 from mpp.methods.tempo._defaults import (
     CHAIN_ID,
@@ -78,6 +79,8 @@ class TempoMethod:
     decimals: int = 6
     client_id: str | None = None
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
+    can_offer: CanOfferFn | None = field(default=None, kw_only=True)
+    on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
     _cached_chain_ids: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _chain_id_explicit: bool = field(default=False, init=False, repr=False)
     _chain_id_lock: asyncio.Lock | None = field(default=None, init=False, repr=False)
@@ -397,6 +400,8 @@ def tempo(
     decimals: int = 6,
     client_id: str | None = None,
     relay: Relay | None = None,
+    can_offer: CanOfferFn | None = None,
+    on_payment_success: PaymentSuccessHandler | None = None,
 ) -> TempoMethod:
     """Create a Tempo payment method.
 
@@ -419,6 +424,8 @@ def tempo(
         decimals: Token decimal places for amount conversion (default: 6).
         client_id: Optional client identity for attribution memos.
         relay: Optional server-side Tempo API relay for the charge intent.
+        can_offer: Optional callback that filters this method's composed offers.
+        on_payment_success: Optional callback invoked after successful verification.
 
     Returns:
         A configured TempoMethod instance.
@@ -465,6 +472,8 @@ def tempo(
         recipient=recipient,
         decimals=decimals,
         client_id=client_id,
+        can_offer=can_offer,
+        on_payment_success=on_payment_success,
     )
     method._chain_id_explicit = chain_id_explicit
     method._rpc_url_explicit = rpc_url_explicit
