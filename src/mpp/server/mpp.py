@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -38,6 +38,7 @@ from mpp.server.verify import (
     _authenticate_echo,
     _body_digest_error,
     _challenge_from_echo,
+    _extract_payment_scheme,
     verify_or_challenge,
 )
 from mpp.store import Store
@@ -92,16 +93,19 @@ class Mpp:
 
     def __init__(
         self,
-        method: Method,
-        realm: str,
-        secret_key: str,
+        method: Method | None = None,
+        realm: str | None = None,
+        secret_key: str | None = None,
         defaults: dict[str, Any] | None = None,
         store: Store | None = None,
+        *,
+        methods: Sequence[Method] | None = None,
     ) -> None:
         """Initialize the payment handler.
 
         Args:
             method: Payment method (e.g., TempoMethod).
+            methods: Ordered payment methods to offer. Mutually exclusive with ``method``.
             realm: Server realm for WWW-Authenticate header.
             secret_key: Server secret for HMAC-bound challenge IDs.
                 Enables stateless challenge verification.
@@ -110,7 +114,13 @@ class Mpp:
                 When provided, automatically wired into intents that
                 accept a ``store`` (e.g., ``ChargeIntent``).
         """
-        self.method = method
+        if realm is None:
+            raise TypeError("realm is required")
+        if secret_key is None:
+            raise TypeError("secret_key is required")
+        self.methods = self._normalize_methods(method, methods)
+        # ``method`` remains the first configured method for compatibility.
+        self.method = self.methods[0]
         self.realm = realm
         self.secret_key = secret_key
         self.defaults = defaults or {}
@@ -137,12 +147,53 @@ class Mpp:
 
     def _wire_store(self, store: Store) -> None:
         """Inject *store* into intents that have a ``_store`` attribute set to None."""
-        intents = getattr(self.method, "intents", None)
-        if not isinstance(intents, Mapping):
-            return
-        for intent_obj in intents.values():
-            if hasattr(intent_obj, "_store") and intent_obj._store is None:
-                intent_obj._store = store
+        for method in self.methods:
+            intents = getattr(method, "intents", None)
+            if not isinstance(intents, Mapping):
+                continue
+            for intent_obj in intents.values():
+                if hasattr(intent_obj, "_store") and intent_obj._store is None:
+                    intent_obj._store = store
+
+    @staticmethod
+    def _normalize_methods(
+        method: Method | None,
+        methods: Sequence[Method] | None,
+    ) -> tuple[Method, ...]:
+        if method is not None and methods is not None:
+            raise ValueError("pass method= or methods=, not both")
+        normalized = (
+            tuple(methods) if methods is not None else (() if method is None else (method,))
+        )
+        if not normalized:
+            raise ValueError("method= or methods= is required")
+        names = [candidate.name for candidate in normalized]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate payment method names: {', '.join(duplicates)}")
+        return normalized
+
+    def _route_method(
+        self,
+        authorization: str | None,
+        intent_name: str,
+        candidates: Sequence[Method],
+    ) -> Method | None:
+        payment_scheme = (
+            _extract_payment_scheme(authorization) if authorization is not None else None
+        )
+        if payment_scheme is None:
+            return None
+        try:
+            credential = Credential.from_authorization(payment_scheme)
+        except ParseError:
+            return candidates[0]
+        for method in candidates:
+            if credential.challenge.method == method.name and intent_name in method.intents:
+                return method
+        # Send malformed or unsupported Payment credentials through the normal
+        # verifier so it emits the established typed failure event.
+        return candidates[0]
 
     def _prepare_credential(
         self,
@@ -152,7 +203,7 @@ class Mpp:
         request: dict[str, Any] | None,
         meta: dict[str, str] | None = _CONTEXT_UNSET,
         body: str | bytes | dict[str, Any] | None = _CONTEXT_UNSET,
-    ) -> tuple[Credential, Intent | VerifiableIntent, dict[str, Any], Challenge]:
+    ) -> tuple[Credential, Method, Intent | VerifiableIntent, dict[str, Any], Challenge]:
         """Authenticate and resolve a credential outside an HTTP route."""
         credential = self._parse_credential(value)
 
@@ -164,7 +215,10 @@ class Mpp:
 
         if echo.realm != self.realm:
             raise InvalidChallengeError(echo.id, "credential realm does not match")
-        if echo.method != self.method.name:
+        method = next(
+            (candidate for candidate in self.methods if candidate.name == echo.method), None
+        )
+        if method is None:
             raise PaymentMethodUnsupportedError(echo.method)
         if intent is not None and echo.intent != intent:
             raise InvalidChallengeError(echo.id, "credential intent does not match")
@@ -180,7 +234,7 @@ class Mpp:
 
         if request is not None:
             expected_request = transform_request(
-                self.method,
+                method,
                 transform_units(request),
                 credential,
             )
@@ -195,11 +249,11 @@ class Mpp:
             if digest_error := _body_digest_error(echo.digest, expected_body):
                 raise InvalidChallengeError(echo.id, digest_error)
 
-        intent_obj = self.method.intents.get(echo.intent)
+        intent_obj = method.intents.get(echo.intent)
         if intent_obj is None:
             raise PaymentMethodUnsupportedError(f"{echo.method}/{echo.intent}")
         challenge = _challenge_from_echo(echo, echoed_request, echoed_opaque)
-        return credential, intent_obj, echoed_request, challenge
+        return credential, method, intent_obj, echoed_request, challenge
 
     @staticmethod
     def _parse_credential(value: Credential | str) -> Credential:
@@ -255,7 +309,7 @@ class Mpp:
             VerificationFailedError: If the intent does not support
                 non-mutating validation or rejects the credential.
         """
-        prepared, intent_obj, echoed_request, _ = self._prepare_credential(
+        prepared, _, intent_obj, echoed_request, _ = self._prepare_credential(
             credential,
             intent=intent,
             request=request,
@@ -307,7 +361,7 @@ class Mpp:
         """
         parsed = self._parse_credential(credential)
         try:
-            prepared, intent_obj, echoed_request, challenge = self._prepare_credential(
+            prepared, method, intent_obj, echoed_request, challenge = self._prepare_credential(
                 parsed,
                 intent=intent,
                 request=request,
@@ -328,7 +382,7 @@ class Mpp:
                     "credential": parsed,
                     "error": error,
                     "intent": intent or echo.intent,
-                    "method": self.method.name,
+                    "method": echo.method,
                     "request": failed_request,
                 },
             )
@@ -337,7 +391,7 @@ class Mpp:
             "challenge": challenge,
             "credential": prepared,
             "intent": intent_obj.name,
-            "method": self.method.name,
+            "method": method.name,
             "request": echoed_request,
         }
         try:
@@ -355,15 +409,18 @@ class Mpp:
     @classmethod
     def create(
         cls,
-        method: Method,
+        method: Method | None = None,
         realm: str | None = None,
         secret_key: str | None = None,
         store: Store | None = None,
+        *,
+        methods: Sequence[Method] | None = None,
     ) -> Mpp:
         """Create an Mpp instance with smart defaults.
 
         Args:
-            method: Payment method (e.g., tempo(currency=..., recipient=...)).
+            method: A payment method (e.g., tempo(currency=..., recipient=...)).
+            methods: Ordered payment methods to offer. Mutually exclusive with ``method``.
             realm: Server realm. Auto-detected from environment if omitted.
             secret_key: HMAC secret. Required unless `MPP_SECRET_KEY` is set.
             store: Optional key-value store for replay protection.
@@ -374,10 +431,61 @@ class Mpp:
             realm=detect_realm() if realm is None else realm,
             secret_key=detect_secret_key() if secret_key is None else secret_key,
             store=store,
+            methods=methods,
         )
 
     async def charge(
         self,
+        authorization: str | None,
+        amount: str,
+        *,
+        currency: str | None = None,
+        recipient: str | None = None,
+        expires: str | None = None,
+        description: str | None = None,
+        memo: str | None = None,
+        splits: list[dict[str, str]] | None = None,
+        fee_payer: bool = False,
+        chain_id: int | None = None,
+        extra: dict[str, str] | None = None,
+        body: str | bytes | dict[str, Any] | None = None,
+    ) -> Challenge | list[Challenge] | tuple[Credential, Receipt]:
+        """Handle a charge intent across the configured payment methods."""
+        supported_methods = [method for method in self.methods if "charge" in method.intents]
+        if not supported_methods:
+            if len(self.methods) == 1:
+                raise ValueError(f"Method {self.method.name} does not support charge intent")
+            raise ValueError("No registered method supports charge intent")
+
+        options = {
+            "currency": currency,
+            "recipient": recipient,
+            "expires": expires,
+            "description": description,
+            "memo": memo,
+            "splits": splits,
+            "fee_payer": fee_payer,
+            "chain_id": chain_id,
+            "extra": extra,
+            "body": body,
+        }
+        if len(self.methods) == 1:
+            return await self._charge_one(self.method, authorization, amount, **options)
+
+        selected_method = self._route_method(authorization, "charge", supported_methods)
+        if selected_method is not None:
+            return await self._charge_one(selected_method, authorization, amount, **options)
+
+        challenges: list[Challenge] = []
+        for candidate in supported_methods:
+            result = await self._charge_one(candidate, None, amount, **options)
+            assert isinstance(result, Challenge)
+            challenges.append(result)
+        return challenges
+
+    async def _charge_one(
+        self,
+        method: Method,
         authorization: str | None,
         amount: str,
         *,
@@ -415,18 +523,18 @@ class Mpp:
         Returns:
             Challenge if payment required, or (Credential, Receipt) if verified.
         """
-        intent = self.method.intents.get("charge")
+        intent = method.intents.get("charge")
         if intent is None:
-            raise ValueError(f"Method {self.method.name} does not support charge intent")
+            raise ValueError(f"Method {method.name} does not support charge intent")
 
-        resolved_currency = currency or getattr(self.method, "currency", None)
-        resolved_recipient = recipient or getattr(self.method, "recipient", None)
+        resolved_currency = currency or getattr(method, "currency", None)
+        resolved_recipient = recipient or getattr(method, "recipient", None)
         if not resolved_currency:
             raise ValueError("currency must be set on the method or passed to charge()")
         if not resolved_recipient:
             raise ValueError("recipient must be set on the method or passed to charge()")
 
-        decimals = getattr(self.method, "decimals", DEFAULT_DECIMALS)
+        decimals = getattr(method, "decimals", DEFAULT_DECIMALS)
         base_amount = str(parse_units(amount, decimals))
 
         request: dict[str, Any] = {
@@ -444,7 +552,7 @@ class Mpp:
 
         resolved_chain_id = chain_id
         if resolved_chain_id is None:
-            resolved_chain_id = getattr(self.method, "chain_id", None)
+            resolved_chain_id = getattr(method, "chain_id", None)
 
         if splits and fee_payer:
             raise ValueError("splits and fee_payer cannot be used together")
@@ -461,7 +569,7 @@ class Mpp:
                 method_details["feePayer"] = True
             request["methodDetails"] = method_details
 
-        request = transform_request(self.method, request, None)
+        request = transform_request(method, request, None)
 
         return await verify_or_challenge(
             authorization=authorization,
@@ -469,7 +577,7 @@ class Mpp:
             request=request,
             realm=self.realm,
             secret_key=self.secret_key,
-            method=self.method.name,
+            method=method.name,
             description=description,
             expires=expires,
             body=body,
@@ -526,69 +634,111 @@ class Mpp:
             async def session_handler(request, credential, receipt):
                 return {"data": "session content"}
         """
-        intent_obj = self.method.intents.get(intent)
-        if intent_obj is None:
-            raise ValueError(f"Method {self.method.name} does not support {intent} intent")
+        supported_methods = [method for method in self.methods if intent in method.intents]
+        if not supported_methods:
+            if len(self.methods) == 1:
+                raise ValueError(f"Method {self.method.name} does not support {intent} intent")
+            raise ValueError(f"No registered method supports {intent} intent")
 
         def decorator(
             handler: Callable[[Any, Credential, Receipt], Awaitable[R]],
         ) -> Callable[[Any], Awaitable[R | Any]]:
             async def _verify(
                 authorization: str | None, _request_obj: Any
-            ) -> Challenge | tuple[Credential, Receipt]:
-                resolved_currency = currency or getattr(self.method, "currency", None)
-                resolved_recipient = recipient or getattr(self.method, "recipient", None)
-                if not resolved_currency:
-                    raise ValueError("currency must be set on the method or passed to pay()")
-                if not resolved_recipient:
-                    raise ValueError("recipient must be set on the method or passed to pay()")
-
-                decimals = getattr(self.method, "decimals", DEFAULT_DECIMALS)
-                base_amount = str(parse_units(amount, decimals))
-
-                challenge_expires: str | None = None
-                if expires_in is not None:
-                    challenge_expires = (datetime.now(UTC) + expires_in).isoformat()
-
-                request: dict[str, Any] = {
-                    "amount": base_amount,
-                    "currency": resolved_currency,
-                    "recipient": resolved_recipient,
+            ) -> Challenge | list[Challenge] | tuple[Credential, Receipt]:
+                resolved_body = await resolve_body_param(body, _request_obj)
+                options = {
+                    "amount": amount,
+                    "currency": currency,
+                    "recipient": recipient,
+                    "description": description,
+                    "expires_in": expires_in,
+                    "chain_id": chain_id,
+                    "extra": extra,
+                    "body": resolved_body,
                 }
+                if len(self.methods) == 1:
+                    return await self._pay_one(
+                        self.method, intent, authorization, _request_obj, **options
+                    )
 
-                if extra is not None:
-                    if any(
-                        not isinstance(k, str) or not isinstance(v, str) for k, v in extra.items()
-                    ):
-                        raise ValueError("extra must be a dict[str, str]")
-                    request["extra"] = extra
+                selected_method = self._route_method(authorization, intent, supported_methods)
+                if selected_method is not None:
+                    return await self._pay_one(
+                        selected_method, intent, authorization, _request_obj, **options
+                    )
 
-                resolved_chain_id = chain_id
-                if resolved_chain_id is None:
-                    resolved_chain_id = getattr(self.method, "chain_id", None)
-                if resolved_chain_id is not None:
-                    request["methodDetails"] = {"chainId": resolved_chain_id}
-
-                request = transform_request(
-                    self.method,
-                    request,
-                    None,
-                )
-                request = bind_framework_scope(request, _request_obj)
-
-                return await verify_or_challenge(
-                    authorization=authorization,
-                    intent=intent_obj,
-                    request=request,
-                    realm=self.realm,
-                    secret_key=self.secret_key,
-                    method=self.method.name,
-                    description=description,
-                    expires=challenge_expires,
-                    body=await resolve_body_param(body, _request_obj),
-                    events=self._events,
-                )
+                challenges: list[Challenge] = []
+                for candidate in supported_methods:
+                    result = await self._pay_one(candidate, intent, None, _request_obj, **options)
+                    assert isinstance(result, Challenge)
+                    challenges.append(result)
+                return challenges
 
             return wrap_payment_handler(handler, _verify, lambda: self.realm)
 
         return decorator
+
+    async def _pay_one(
+        self,
+        method: Method,
+        intent_name: str,
+        authorization: str | None,
+        request_obj: Any,
+        *,
+        amount: str,
+        currency: str | None,
+        recipient: str | None,
+        description: str | None,
+        expires_in: timedelta | None,
+        chain_id: int | None,
+        extra: dict[str, str] | None,
+        body: str | bytes | dict[str, Any] | None,
+    ) -> Challenge | tuple[Credential, Receipt]:
+        intent_obj = method.intents[intent_name]
+        resolved_currency = currency or getattr(method, "currency", None)
+        resolved_recipient = recipient or getattr(method, "recipient", None)
+        if not resolved_currency:
+            raise ValueError("currency must be set on the method or passed to pay()")
+        if not resolved_recipient:
+            raise ValueError("recipient must be set on the method or passed to pay()")
+
+        decimals = getattr(method, "decimals", DEFAULT_DECIMALS)
+        base_amount = str(parse_units(amount, decimals))
+
+        challenge_expires: str | None = None
+        if expires_in is not None:
+            challenge_expires = (datetime.now(UTC) + expires_in).isoformat()
+
+        request: dict[str, Any] = {
+            "amount": base_amount,
+            "currency": resolved_currency,
+            "recipient": resolved_recipient,
+        }
+
+        if extra is not None:
+            if any(not isinstance(k, str) or not isinstance(v, str) for k, v in extra.items()):
+                raise ValueError("extra must be a dict[str, str]")
+            request["extra"] = extra
+
+        resolved_chain_id = chain_id
+        if resolved_chain_id is None:
+            resolved_chain_id = getattr(method, "chain_id", None)
+        if resolved_chain_id is not None:
+            request["methodDetails"] = {"chainId": resolved_chain_id}
+
+        request = transform_request(method, request, None)
+        request = bind_framework_scope(request, request_obj)
+
+        return await verify_or_challenge(
+            authorization=authorization,
+            intent=intent_obj,
+            request=request,
+            realm=self.realm,
+            secret_key=self.secret_key,
+            method=method.name,
+            description=description,
+            expires=challenge_expires,
+            body=body,
+            events=self._events,
+        )

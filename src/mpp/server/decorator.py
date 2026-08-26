@@ -120,7 +120,7 @@ def bind_framework_scope(request_params: dict[str, Any], request_obj: Any) -> di
 
 
 def make_challenge_response(
-    challenge: Challenge,
+    challenge: Challenge | list[Challenge],
     realm: str,
     error: PaymentError | None = None,
 ) -> Any:
@@ -129,27 +129,37 @@ def make_challenge_response(
     Returns a Starlette ``Response`` when starlette is installed,
     otherwise a plain dict with ``_mpp_challenge``, ``status``, and ``headers``.
     """
-    error = error or PaymentRequiredError(realm=realm, description=challenge.description)
-    body = _json.dumps(error.to_problem_details(challenge.id))
+    challenges = challenge if isinstance(challenge, list) else [challenge]
+    primary = challenges[0]
+    error = error or PaymentRequiredError(realm=realm, description=primary.description)
+    body = _json.dumps(error.to_problem_details(primary.id))
     headers = {
-        "WWW-Authenticate": challenge.to_www_authenticate(realm),
         "Cache-Control": "no-store",
         "Content-Type": "application/problem+json",
     }
     try:
         from starlette.responses import Response
 
-        return Response(
+        response = Response(
             content=body,
             status_code=402,
             headers=headers,
             media_type="application/problem+json",
         )
+        for item in challenges:
+            response.headers.append("WWW-Authenticate", item.to_www_authenticate(realm))
+        return response
     except ImportError:
+        www_authenticate = [item.to_www_authenticate(realm) for item in challenges]
         return {
             "_mpp_challenge": True,
             "status": 402,
-            "headers": headers,
+            "headers": {
+                **headers,
+                "WWW-Authenticate": www_authenticate[0]
+                if len(www_authenticate) == 1
+                else www_authenticate,
+            },
             "body": body,
         }
 
@@ -168,7 +178,9 @@ async def resolve_body_param(body: BodyParamsType, request_obj: Any) -> BodyType
 
 def wrap_payment_handler(
     handler: Callable[..., Awaitable[R]],
-    verify_fn: Callable[[str | None, Any], Awaitable[Challenge | tuple[Credential, Receipt]]],
+    verify_fn: Callable[
+        [str | None, Any], Awaitable[Challenge | list[Challenge] | tuple[Credential, Receipt]]
+    ],
     realm_fn: Callable[[], str],
 ) -> Callable[..., Awaitable[R | Any]]:
     """Wrap a handler with the payment challenge/verify flow.
@@ -214,7 +226,7 @@ def wrap_payment_handler(
                 raise
             return make_challenge_response(error.retry_challenge, realm_fn(), error)
 
-        if isinstance(result, Challenge):
+        if isinstance(result, (Challenge, list)):
             return make_challenge_response(result, realm_fn())
 
         credential, receipt = result
