@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from mpp import Challenge, Credential
+from mpp.events import ServerPaymentSuccessPayload
 from mpp.methods.tempo._attribution import encode as encode_attribution
 from mpp.methods.tempo._defaults import (
     CHAIN_ID,
@@ -36,6 +38,8 @@ DEFAULT_GAS_LIMIT = 1_000_000
 EXPIRING_NONCE_KEY = (1 << 256) - 1  # U256::MAX
 FEE_PAYER_VALID_BEFORE_SECS = 25
 _CHAIN_ID_UNSET = object()
+CanOfferFn = Callable[[dict[str, Any]], bool | Awaitable[bool]]
+PaymentSuccessHandler = Callable[[ServerPaymentSuccessPayload], Any | Awaitable[Any]]
 
 
 class TransactionError(Exception):
@@ -77,6 +81,8 @@ class TempoMethod:
     recipient: str | None = None
     decimals: int = 6
     client_id: str | None = None
+    can_offer: CanOfferFn | None = field(default=None, kw_only=True)
+    on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
     _cached_chain_ids: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _chain_id_explicit: bool = field(default=False, init=False, repr=False)
@@ -397,6 +403,8 @@ def tempo(
     decimals: int = 6,
     client_id: str | None = None,
     relay: Relay | None = None,
+    can_offer: CanOfferFn | None = None,
+    on_payment_success: PaymentSuccessHandler | None = None,
 ) -> TempoMethod:
     """Create a Tempo payment method.
 
@@ -419,6 +427,8 @@ def tempo(
         decimals: Token decimal places for amount conversion (default: 6).
         client_id: Optional client identity for attribution memos.
         relay: Optional server-side Tempo API relay for the charge intent.
+        can_offer: Optional callback that determines whether to advertise this method.
+        on_payment_success: Optional callback invoked after successful verification.
 
     Returns:
         A configured TempoMethod instance.
@@ -465,6 +475,8 @@ def tempo(
         recipient=recipient,
         decimals=decimals,
         client_id=client_id,
+        can_offer=can_offer,
+        on_payment_success=on_payment_success,
     )
     method._chain_id_explicit = chain_id_explicit
     method._rpc_url_explicit = rpc_url_explicit

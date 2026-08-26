@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from mpp import Challenge, Credential
+from mpp.events import ServerPaymentSuccessPayload
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -48,6 +49,8 @@ class OnChallengeParameters:
 
 
 CreateTokenFn = Callable[[OnChallengeParameters], Awaitable[str]]
+CanOfferFn = Callable[[dict[str, Any]], bool | Awaitable[bool]]
+PaymentSuccessHandler = Callable[[ServerPaymentSuccessPayload], Any | Awaitable[Any]]
 
 
 @dataclass
@@ -66,6 +69,8 @@ class StripeMethod:
     recipient: str | None = None
     network_id: str | None = None
     payment_method_types: list[str] = field(default_factory=lambda: ["card"])
+    can_offer: CanOfferFn | None = field(default=None, kw_only=True)
+    on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
 
     @property
@@ -194,6 +199,8 @@ def stripe(
     recipient: str | None = None,
     network_id: str | None = None,
     payment_method_types: list[str] | None = None,
+    can_offer: CanOfferFn | None = None,
+    on_payment_success: PaymentSuccessHandler | None = None,
 ) -> StripeMethod:
     """Create a Stripe payment method.
 
@@ -212,6 +219,8 @@ def stripe(
             challenge ``methodDetails.networkId``.
         payment_method_types: Stripe payment method types (default: ``["card"]``).
             Included in challenge ``methodDetails.paymentMethodTypes``.
+        can_offer: Optional callback that determines whether to advertise this method.
+        on_payment_success: Optional callback invoked after successful verification.
 
     Returns:
         A configured :class:`StripeMethod` instance.
@@ -244,6 +253,8 @@ def stripe(
         recipient=recipient,
         network_id=network_id,
         payment_method_types=payment_method_types or ["card"],
+        can_offer=can_offer,
+        on_payment_success=on_payment_success,
     )
     method._intents = dict(intents)
     return method

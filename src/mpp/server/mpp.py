@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -21,6 +22,7 @@ from mpp.events import (
     PAYMENT_SUCCESS,
     EventDispatcher,
     EventHandler,
+    ServerPaymentSuccessPayload,
     Unsubscribe,
 )
 from mpp.server._defaults import detect_realm, detect_secret_key
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
     from mpp.server.method import Method
 
 R = TypeVar("R")
+MethodPaymentSuccessHandler = Callable[[ServerPaymentSuccessPayload], Any | Awaitable[Any]]
 
 DEFAULT_DECIMALS = 6
 
@@ -128,6 +131,7 @@ class Mpp:
 
         if store is not None:
             self._wire_store(store)
+        self._register_method_payment_success_handlers()
 
     def on(self, name: str, handler: EventHandler) -> Unsubscribe:
         """Register a server payment event handler."""
@@ -155,6 +159,29 @@ class Mpp:
                 if hasattr(intent_obj, "_store") and intent_obj._store is None:
                     intent_obj._store = store
 
+    def _register_method_payment_success_handlers(self) -> None:
+        """Register each configured method's optional success callback."""
+        for method in self.methods:
+            handler = getattr(method, "on_payment_success", None)
+            if handler is None:
+                continue
+            if not callable(handler):
+                raise ValueError("on_payment_success must be callable")
+
+            method_name = method.name
+
+            def dispatch(
+                payload: ServerPaymentSuccessPayload,
+                *,
+                callback: MethodPaymentSuccessHandler = handler,
+                registered_method: str = method_name,
+            ) -> Any:
+                if payload.get("method") == registered_method:
+                    return callback(payload)
+                return None
+
+            self.on(PAYMENT_SUCCESS, dispatch)
+
     @staticmethod
     def _normalize_methods(
         method: Method | None,
@@ -172,6 +199,20 @@ class Mpp:
         if duplicates:
             raise ValueError(f"duplicate payment method names: {', '.join(duplicates)}")
         return normalized
+
+    async def _can_offer(self, method: Method, request: dict[str, Any]) -> bool:
+        """Return whether *method* may advertise a new payment challenge."""
+        callback = getattr(method, "can_offer", None)
+        if callback is None:
+            return True
+        if not callable(callback):
+            raise ValueError("can_offer must be callable")
+        available = callback(request)
+        if inspect.isawaitable(available):
+            available = await available
+        if not isinstance(available, bool):
+            raise ValueError("can_offer must return bool")
+        return available
 
     def _route_method(
         self,
@@ -470,17 +511,39 @@ class Mpp:
             "body": body,
         }
         if len(self.methods) == 1:
-            return await self._charge_one(self.method, authorization, amount, **options)
+            result = await self._charge_one(
+                self.method,
+                authorization,
+                amount,
+                **options,
+                check_can_offer=(
+                    authorization is None or _extract_payment_scheme(authorization) is None
+                ),
+            )
+            if result is None:
+                raise ValueError("No payment offers are available for this request")
+            return result
 
         selected_method = self._route_method(authorization, "charge", supported_methods)
         if selected_method is not None:
-            return await self._charge_one(selected_method, authorization, amount, **options)
+            result = await self._charge_one(selected_method, authorization, amount, **options)
+            assert result is not None
+            return result
 
         challenges: list[Challenge] = []
         for candidate in supported_methods:
-            result = await self._charge_one(candidate, None, amount, **options)
-            assert isinstance(result, Challenge)
-            challenges.append(result)
+            result = await self._charge_one(
+                candidate,
+                None,
+                amount,
+                **options,
+                check_can_offer=True,
+            )
+            if result is not None:
+                assert isinstance(result, Challenge)
+                challenges.append(result)
+        if not challenges:
+            raise ValueError("No payment offers are available for this request")
         return challenges
 
     async def _charge_one(
@@ -499,7 +562,8 @@ class Mpp:
         chain_id: int | None = None,
         extra: dict[str, str] | None = None,
         body: str | bytes | dict[str, Any] | None = None,
-    ) -> Challenge | tuple[Credential, Receipt]:
+        check_can_offer: bool = False,
+    ) -> Challenge | tuple[Credential, Receipt] | None:
         """Handle a charge intent.
 
         Args:
@@ -570,6 +634,9 @@ class Mpp:
             request["methodDetails"] = method_details
 
         request = transform_request(method, request, None)
+
+        if check_can_offer and not await self._can_offer(method, request):
+            return None
 
         return await verify_or_challenge(
             authorization=authorization,
@@ -658,21 +725,43 @@ class Mpp:
                     "body": resolved_body,
                 }
                 if len(self.methods) == 1:
-                    return await self._pay_one(
-                        self.method, intent, authorization, _request_obj, **options
+                    result = await self._pay_one(
+                        self.method,
+                        intent,
+                        authorization,
+                        _request_obj,
+                        **options,
+                        check_can_offer=(
+                            authorization is None or _extract_payment_scheme(authorization) is None
+                        ),
                     )
+                    if result is None:
+                        raise ValueError("No payment offers are available for this request")
+                    return result
 
                 selected_method = self._route_method(authorization, intent, supported_methods)
                 if selected_method is not None:
-                    return await self._pay_one(
+                    result = await self._pay_one(
                         selected_method, intent, authorization, _request_obj, **options
                     )
+                    assert result is not None
+                    return result
 
                 challenges: list[Challenge] = []
                 for candidate in supported_methods:
-                    result = await self._pay_one(candidate, intent, None, _request_obj, **options)
-                    assert isinstance(result, Challenge)
-                    challenges.append(result)
+                    result = await self._pay_one(
+                        candidate,
+                        intent,
+                        None,
+                        _request_obj,
+                        **options,
+                        check_can_offer=True,
+                    )
+                    if result is not None:
+                        assert isinstance(result, Challenge)
+                        challenges.append(result)
+                if not challenges:
+                    raise ValueError("No payment offers are available for this request")
                 return challenges
 
             return wrap_payment_handler(handler, _verify, lambda: self.realm)
@@ -694,7 +783,8 @@ class Mpp:
         chain_id: int | None,
         extra: dict[str, str] | None,
         body: str | bytes | dict[str, Any] | None,
-    ) -> Challenge | tuple[Credential, Receipt]:
+        check_can_offer: bool = False,
+    ) -> Challenge | tuple[Credential, Receipt] | None:
         intent_obj = method.intents[intent_name]
         resolved_currency = currency or getattr(method, "currency", None)
         resolved_recipient = recipient or getattr(method, "recipient", None)
@@ -729,6 +819,9 @@ class Mpp:
 
         request = transform_request(method, request, None)
         request = bind_framework_scope(request, request_obj)
+
+        if check_can_offer and not await self._can_offer(method, request):
+            return None
 
         return await verify_or_challenge(
             authorization=authorization,
