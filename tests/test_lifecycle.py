@@ -218,6 +218,7 @@ async def test_bound_broadcast_emits_failures() -> None:
     [
         (_bound(realm="other.example.com"), None),
         (_bound({"amount": "1000"}), {"amount": "2000"}),
+        (_bound(method="stripe"), None),
     ],
 )
 async def test_bound_broadcast_emits_preparation_failures(
@@ -228,13 +229,14 @@ async def test_bound_broadcast_emits_preparation_failures(
     failures: list[dict[str, Any]] = []
     server.on_payment_failed(failures.append)
 
-    with pytest.raises(InvalidChallengeError):
+    with pytest.raises((InvalidChallengeError, PaymentMethodUnsupportedError)):
         await server.broadcast_credential(credential, request=route_request)
 
     assert len(failures) == 1
     assert failures[0]["challenge"].id == credential.challenge.id
     assert failures[0]["credential"] == credential
-    assert isinstance(failures[0]["error"], InvalidChallengeError)
+    assert failures[0]["method"] == "tempo"
+    assert isinstance(failures[0]["error"], (InvalidChallengeError, PaymentMethodUnsupportedError))
 
 
 @pytest.mark.asyncio

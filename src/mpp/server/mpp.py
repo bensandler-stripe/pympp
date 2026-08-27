@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from mpp import Challenge, Credential, Receipt
 from mpp._parsing import ParseError, _b64_decode, _parse_timestamp
@@ -24,6 +24,7 @@ from mpp.events import (
     Unsubscribe,
 )
 from mpp.server._defaults import detect_realm, detect_secret_key
+from mpp.server.compose import ComposedHandler, ComposedResult, ComposeEntry, ComposeOptions
 from mpp.server.decorator import (
     BodyParamsType,
     bind_framework_scope,
@@ -111,6 +112,7 @@ class Mpp:
                 accept a ``store`` (e.g., ``ChargeIntent``).
         """
         self.method = method
+        self.methods = (method,)
         self.realm = realm
         self.secret_key = secret_key
         self.defaults = defaults or {}
@@ -137,12 +139,13 @@ class Mpp:
 
     def _wire_store(self, store: Store) -> None:
         """Inject *store* into intents that have a ``_store`` attribute set to None."""
-        intents = getattr(self.method, "intents", None)
-        if not isinstance(intents, Mapping):
-            return
-        for intent_obj in intents.values():
-            if hasattr(intent_obj, "_store") and intent_obj._store is None:
-                intent_obj._store = store
+        for method in self.methods:
+            intents = getattr(method, "intents", None)
+            if not isinstance(intents, Mapping):
+                continue
+            for intent_obj in intents.values():
+                if hasattr(intent_obj, "_store") and intent_obj._store is None:
+                    intent_obj._store = store
 
     def _prepare_credential(
         self,
@@ -152,7 +155,7 @@ class Mpp:
         request: dict[str, Any] | None,
         meta: dict[str, str] | None = _CONTEXT_UNSET,
         body: str | bytes | dict[str, Any] | None = _CONTEXT_UNSET,
-    ) -> tuple[Credential, Intent | VerifiableIntent, dict[str, Any], Challenge]:
+    ) -> tuple[Credential, Method, Intent | VerifiableIntent, dict[str, Any], Challenge]:
         """Authenticate and resolve a credential outside an HTTP route."""
         credential = self._parse_credential(value)
 
@@ -164,7 +167,10 @@ class Mpp:
 
         if echo.realm != self.realm:
             raise InvalidChallengeError(echo.id, "credential realm does not match")
-        if echo.method != self.method.name:
+        method = next(
+            (candidate for candidate in self.methods if candidate.name == echo.method), None
+        )
+        if method is None:
             raise PaymentMethodUnsupportedError(echo.method)
         if intent is not None and echo.intent != intent:
             raise InvalidChallengeError(echo.id, "credential intent does not match")
@@ -180,7 +186,7 @@ class Mpp:
 
         if request is not None:
             expected_request = transform_request(
-                self.method,
+                method,
                 transform_units(request),
                 credential,
             )
@@ -195,11 +201,11 @@ class Mpp:
             if digest_error := _body_digest_error(echo.digest, expected_body):
                 raise InvalidChallengeError(echo.id, digest_error)
 
-        intent_obj = self.method.intents.get(echo.intent)
+        intent_obj = method.intents.get(echo.intent)
         if intent_obj is None:
             raise PaymentMethodUnsupportedError(f"{echo.method}/{echo.intent}")
         challenge = _challenge_from_echo(echo, echoed_request, echoed_opaque)
-        return credential, intent_obj, echoed_request, challenge
+        return credential, method, intent_obj, echoed_request, challenge
 
     @staticmethod
     def _parse_credential(value: Credential | str) -> Credential:
@@ -255,7 +261,7 @@ class Mpp:
             VerificationFailedError: If the intent does not support
                 non-mutating validation or rejects the credential.
         """
-        prepared, intent_obj, echoed_request, _ = self._prepare_credential(
+        prepared, _, intent_obj, echoed_request, _ = self._prepare_credential(
             credential,
             intent=intent,
             request=request,
@@ -307,7 +313,7 @@ class Mpp:
         """
         parsed = self._parse_credential(credential)
         try:
-            prepared, intent_obj, echoed_request, challenge = self._prepare_credential(
+            prepared, method, intent_obj, echoed_request, challenge = self._prepare_credential(
                 parsed,
                 intent=intent,
                 request=request,
@@ -316,6 +322,10 @@ class Mpp:
             )
         except Exception as error:
             echo = parsed.challenge
+            event_method = next(
+                (candidate.name for candidate in self.methods if candidate.name == echo.method),
+                self.method.name,
+            )
             try:
                 decoded_request = _b64_decode(echo.request) if echo.request else {}
             except ParseError:
@@ -328,7 +338,7 @@ class Mpp:
                     "credential": parsed,
                     "error": error,
                     "intent": intent or echo.intent,
-                    "method": self.method.name,
+                    "method": event_method,
                     "request": failed_request,
                 },
             )
@@ -337,7 +347,7 @@ class Mpp:
             "challenge": challenge,
             "credential": prepared,
             "intent": intent_obj.name,
-            "method": self.method.name,
+            "method": method.name,
             "request": echoed_request,
         }
         try:
@@ -353,28 +363,80 @@ class Mpp:
         return receipt
 
     @classmethod
+    @overload
     def create(
         cls,
         method: Method,
         realm: str | None = None,
         secret_key: str | None = None,
         store: Store | None = None,
+    ) -> Mpp: ...
+
+    @classmethod
+    @overload
+    def create(
+        cls,
+        *,
+        methods: Sequence[Method],
+        realm: str | None = None,
+        secret_key: str | None = None,
+        store: Store | None = None,
+    ) -> Mpp: ...
+
+    @classmethod
+    def create(
+        cls,
+        method: Method | None = None,
+        realm: str | None = None,
+        secret_key: str | None = None,
+        store: Store | None = None,
+        *,
+        methods: Sequence[Method] | None = None,
     ) -> Mpp:
         """Create an Mpp instance with smart defaults.
 
         Args:
             method: Payment method (e.g., tempo(currency=..., recipient=...)).
+            methods: Ordered payment methods. Mutually exclusive with ``method``.
             realm: Server realm. Auto-detected from environment if omitted.
             secret_key: HMAC secret. Required unless `MPP_SECRET_KEY` is set.
             store: Optional key-value store for replay protection.
                 Automatically wired into intents that accept a store.
         """
-        return cls(
-            method=method,
-            realm=detect_realm() if realm is None else realm,
-            secret_key=detect_secret_key() if secret_key is None else secret_key,
+        if method is not None and methods is not None:
+            raise ValueError("pass method= or methods=, not both")
+        configured = (
+            tuple(methods) if methods is not None else (() if method is None else (method,))
+        )
+        if not configured:
+            raise ValueError("method= or methods= is required")
+        names = [candidate.name for candidate in configured]
+        if len(set(names)) != len(names):
+            raise ValueError("payment method names must be unique")
+
+        resolved_realm = detect_realm() if realm is None else realm
+        resolved_secret_key = detect_secret_key() if secret_key is None else secret_key
+        server = cls(
+            method=configured[0],
+            realm=resolved_realm,
+            secret_key=resolved_secret_key,
             store=store,
         )
+        if len(configured) > 1:
+            server.methods = configured
+            if store is not None:
+                server._wire_store(store)
+        return server
+
+    def compose(
+        self,
+        *entries: ComposeEntry,
+        body: BodyParamsType = None,
+    ) -> ComposedHandler:
+        """Configure one or more payment offers for an endpoint."""
+        from mpp.server.compose import _configure_entries
+
+        return _configure_entries(self, entries, body)
 
     async def charge(
         self,
@@ -391,7 +453,7 @@ class Mpp:
         chain_id: int | None = None,
         extra: dict[str, str] | None = None,
         body: str | bytes | dict[str, Any] | None = None,
-    ) -> Challenge | tuple[Credential, Receipt]:
+    ) -> Challenge | ComposedResult:
         """Handle a charge intent.
 
         Args:
@@ -413,65 +475,42 @@ class Mpp:
                 digest and submitted credentials must echo a matching digest.
 
         Returns:
-            Challenge if payment required, or (Credential, Receipt) if verified.
+            Challenge, or ComposedChallenges for multiple methods, if payment
+            is required; otherwise (Credential, Receipt).
         """
-        intent = self.method.intents.get("charge")
-        if intent is None:
+        methods = [method for method in self.methods if "charge" in method.intents]
+        if not methods:
             raise ValueError(f"Method {self.method.name} does not support charge intent")
-
-        resolved_currency = currency or getattr(self.method, "currency", None)
-        resolved_recipient = recipient or getattr(self.method, "recipient", None)
-        if not resolved_currency:
-            raise ValueError("currency must be set on the method or passed to charge()")
-        if not resolved_recipient:
-            raise ValueError("recipient must be set on the method or passed to charge()")
-
-        decimals = getattr(self.method, "decimals", DEFAULT_DECIMALS)
-        base_amount = str(parse_units(amount, decimals))
-
-        request: dict[str, Any] = {
-            "amount": base_amount,
-            "currency": resolved_currency,
-            "recipient": resolved_recipient,
+        options: ComposeOptions = {
+            "amount": amount,
+            "currency": currency,
+            "recipient": recipient,
+            "expires": expires,
+            "description": description,
+            "memo": memo,
+            "splits": splits,
+            "fee_payer": fee_payer,
+            "chain_id": chain_id,
+            "extra": extra,
         }
+        if len(methods) > 1:
+            return await self.compose(
+                *((method, options) for method in methods),
+                body=body,
+            ).verify(authorization)
 
-        # Optional server-provided metadata that will be echoed back by the client
-        # because it is embedded in the base64url-encoded `request`.
-        if extra is not None:
-            if any((not isinstance(k, str) or not isinstance(v, str)) for k, v in extra.items()):
-                raise ValueError("extra must be a dict[str, str]")
-            request["extra"] = extra
-
-        resolved_chain_id = chain_id
-        if resolved_chain_id is None:
-            resolved_chain_id = getattr(self.method, "chain_id", None)
-
-        if splits and fee_payer:
-            raise ValueError("splits and fee_payer cannot be used together")
-
-        if memo or splits or fee_payer or resolved_chain_id is not None:
-            method_details: dict[str, Any] = {}
-            if resolved_chain_id is not None:
-                method_details["chainId"] = resolved_chain_id
-            if memo:
-                method_details["memo"] = memo
-            if splits:
-                method_details["splits"] = splits
-            if fee_payer:
-                method_details["feePayer"] = True
-            request["methodDetails"] = method_details
-
-        request = transform_request(self.method, request, None)
-
+        intent, request, challenge_expires = self._build_offer_request(
+            methods[0], "charge", options, None, api_name="charge"
+        )
         return await verify_or_challenge(
             authorization=authorization,
             intent=intent,
             request=request,
             realm=self.realm,
             secret_key=self.secret_key,
-            method=self.method.name,
+            method=methods[0].name,
             description=description,
-            expires=expires,
+            expires=challenge_expires,
             body=body,
             events=self._events,
         )
@@ -526,9 +565,23 @@ class Mpp:
             async def session_handler(request, credential, receipt):
                 return {"data": "session content"}
         """
-        intent_obj = self.method.intents.get(intent)
-        if intent_obj is None:
+        methods = [method for method in self.methods if intent in method.intents]
+        if not methods:
             raise ValueError(f"Method {self.method.name} does not support {intent} intent")
+        options: ComposeOptions = {
+            "amount": amount,
+            "currency": currency,
+            "recipient": recipient,
+            "description": description,
+            "expires_in": expires_in,
+            "chain_id": chain_id,
+            "extra": extra,
+        }
+        if len(methods) > 1:
+            return self.compose(
+                *((f"{method.name}/{intent}", options) for method in methods),
+                body=body,
+            )
 
         def decorator(
             handler: Callable[[Any, Credential, Receipt], Awaitable[R]],
@@ -536,53 +589,20 @@ class Mpp:
             async def _verify(
                 authorization: str | None, _request_obj: Any
             ) -> Challenge | tuple[Credential, Receipt]:
-                resolved_currency = currency or getattr(self.method, "currency", None)
-                resolved_recipient = recipient or getattr(self.method, "recipient", None)
-                if not resolved_currency:
-                    raise ValueError("currency must be set on the method or passed to pay()")
-                if not resolved_recipient:
-                    raise ValueError("recipient must be set on the method or passed to pay()")
-
-                decimals = getattr(self.method, "decimals", DEFAULT_DECIMALS)
-                base_amount = str(parse_units(amount, decimals))
-
-                challenge_expires: str | None = None
-                if expires_in is not None:
-                    challenge_expires = (datetime.now(UTC) + expires_in).isoformat()
-
-                request: dict[str, Any] = {
-                    "amount": base_amount,
-                    "currency": resolved_currency,
-                    "recipient": resolved_recipient,
-                }
-
-                if extra is not None:
-                    if any(
-                        not isinstance(k, str) or not isinstance(v, str) for k, v in extra.items()
-                    ):
-                        raise ValueError("extra must be a dict[str, str]")
-                    request["extra"] = extra
-
-                resolved_chain_id = chain_id
-                if resolved_chain_id is None:
-                    resolved_chain_id = getattr(self.method, "chain_id", None)
-                if resolved_chain_id is not None:
-                    request["methodDetails"] = {"chainId": resolved_chain_id}
-
-                request = transform_request(
-                    self.method,
-                    request,
-                    None,
+                intent_obj, request, challenge_expires = self._build_offer_request(
+                    methods[0],
+                    intent,
+                    options,
+                    _request_obj,
+                    api_name="pay",
                 )
-                request = bind_framework_scope(request, _request_obj)
-
                 return await verify_or_challenge(
                     authorization=authorization,
                     intent=intent_obj,
                     request=request,
                     realm=self.realm,
                     secret_key=self.secret_key,
-                    method=self.method.name,
+                    method=methods[0].name,
                     description=description,
                     expires=challenge_expires,
                     body=await resolve_body_param(body, _request_obj),
@@ -592,3 +612,65 @@ class Mpp:
             return wrap_payment_handler(handler, _verify, lambda: self.realm)
 
         return decorator
+
+    def _build_offer_request(
+        self,
+        method: Method,
+        intent_name: str,
+        options: Mapping[str, Any],
+        request_obj: Any,
+        *,
+        api_name: Literal["charge", "pay", "compose"],
+    ) -> tuple[Intent | VerifiableIntent, dict[str, Any], str | None]:
+        """Build the canonical request shared by one configured payment offer."""
+        intent = method.intents[intent_name]
+        currency = options.get("currency") or getattr(method, "currency", None)
+        recipient = options.get("recipient") or getattr(method, "recipient", None)
+        if not currency:
+            raise ValueError(f"currency must be set on the method or passed to {api_name}()")
+        if not recipient:
+            raise ValueError(f"recipient must be set on the method or passed to {api_name}()")
+
+        request: dict[str, Any] = {
+            "amount": str(
+                parse_units(options["amount"], getattr(method, "decimals", DEFAULT_DECIMALS))
+            ),
+            "currency": currency,
+            "recipient": recipient,
+        }
+        extra = options.get("extra")
+        if extra is not None:
+            if any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in extra.items()
+            ):
+                raise ValueError("extra must be a dict[str, str]")
+            request["extra"] = extra
+
+        chain_id = options.get("chain_id")
+        if chain_id is None:
+            chain_id = getattr(method, "chain_id", None)
+        splits = options.get("splits")
+        fee_payer = options.get("fee_payer", False)
+        if splits and fee_payer:
+            raise ValueError("splits and fee_payer cannot be used together")
+        memo = options.get("memo")
+        details = {
+            key: value
+            for key, value in (("memo", memo), ("splits", splits), ("feePayer", fee_payer))
+            if value
+        }
+        if chain_id is not None:
+            details["chainId"] = chain_id
+        if details:
+            request["methodDetails"] = details
+
+        expires = options.get("expires")
+        expires_in = options.get("expires_in")
+        if expires is not None and expires_in is not None:
+            raise ValueError("expires and expires_in cannot both be set")
+        if expires_in is not None:
+            expires = (datetime.now(UTC) + expires_in).isoformat()
+
+        request = transform_request(method, request, None)
+        return intent, bind_framework_scope(request, request_obj), expires
