@@ -36,6 +36,7 @@ class ComposeOptions(TypedDict, total=False):
     fee_payer: bool
     chain_id: int | None
     extra: dict[str, str] | None
+    meta: dict[str, str] | None
 
 
 ComposeEntry: TypeAlias = tuple[Method | str, ComposeOptions]
@@ -94,10 +95,19 @@ class _PreparedOffer:
             secret_key=server.secret_key,
             method=self.offer.method.name,
             description=self.offer.options.get("description"),
+            meta=self.offer.options.get("meta"),
             expires=self.expires,
             body=self.body,
             events=server._events,
         )
+
+
+class _AmbiguousOffersError(Exception):
+    """Credential authenticates against indistinguishable configured offers."""
+
+    def __init__(self, offers: Sequence[_PreparedOffer]) -> None:
+        self.offers = tuple(offers)
+        super().__init__("credential matches multiple configured offers")
 
 
 def _parse_credential(authorization: str | None) -> Credential | None:
@@ -157,7 +167,18 @@ class ComposedHandler:
                 if offer.method.name == credential.challenge.method
                 and offer.intent == credential.challenge.intent
             ]
-            selected_offer = self._select_offer(credential, prepared_offers)
+            try:
+                selected_offer = self._select_offer(credential, prepared_offers)
+            except _AmbiguousOffersError as error:
+                challenges: list[Challenge] = []
+                for prepared_offer in error.offers:
+                    result = await prepared_offer.verify(None)
+                    if not isinstance(result, Challenge):
+                        raise RuntimeError(
+                            "offer without a credential returned a receipt"
+                        ) from error
+                    challenges.append(result)
+                return ComposedChallenges(tuple(challenges))
             if selected_offer is not None:
                 result = await selected_offer.verify(authorization)
                 return ComposedChallenges((result,)) if isinstance(result, Challenge) else result
@@ -188,20 +209,34 @@ class ComposedHandler:
             echoed_request = (
                 _b64_decode(credential.challenge.request) if credential.challenge.request else {}
             )
+            echoed_meta = (
+                _b64_decode(credential.challenge.opaque) if credential.challenge.opaque else None
+            )
         except ParseError:
             return None
 
         request_matches = [offer for offer in offers if offer.request == echoed_request]
         digest = credential.challenge.digest
-        body_matches = [
+        binding_matches = [
             offer
             for offer in request_matches
             if digest == (_body_digest.compute(offer.body) if offer.body is not None else None)
+            and echoed_meta == offer.offer.options.get("meta")
         ]
-        for prepared_offer in (*body_matches, *request_matches, *offers):
+        authenticated_matches = [offer for offer in binding_matches if offer.offer.owns(credential)]
+        if len(authenticated_matches) > 1:
+            raise _AmbiguousOffersError(authenticated_matches)
+        if authenticated_matches:
+            return authenticated_matches[0]
+
+        for prepared_offer in (*binding_matches, *request_matches, *offers):
             if prepared_offer.offer.owns(credential):
                 return prepared_offer
-        return request_matches[0] if request_matches else (offers[0] if offers else None)
+        if binding_matches:
+            return binding_matches[0]
+        if request_matches:
+            return request_matches[0]
+        return offers[0] if offers else None
 
 
 def compose(*handlers: ComposedHandler) -> ComposedHandler:
@@ -252,6 +287,15 @@ def _configure_entries(
             raise ValueError("compose() options expires and expires_in cannot both be set")
         if raw_options.get("splits") and raw_options.get("fee_payer"):
             raise ValueError("splits and fee_payer cannot be used together")
+        meta = raw_options.get("meta")
+        if meta is not None and (
+            not isinstance(meta, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in meta.items()
+            )
+        ):
+            raise ValueError("meta must be a dict[str, str]")
         options = cast(ComposeOptions, raw_options)
         if not (options.get("currency") or getattr(method, "currency", None)):
             raise ValueError("currency must be set on the method or compose() offer")

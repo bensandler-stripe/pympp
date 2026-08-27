@@ -13,7 +13,7 @@ method = tempo(
     recipient="acct_consumer",
 )
 server = server_api.Mpp.create(method=method, realm="example.com", secret_key="secret")
-options: server_api.ComposeOptions = {"amount": "1.00"}
+options: server_api.ComposeOptions = {"amount": "1.00", "meta": {"plan": "pro"}}
 entry: server_api.ComposeEntry = (method, options)
 handler = server.compose(entry)
 assert_type(handler, server_api.ComposedHandler)

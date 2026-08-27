@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -110,6 +111,8 @@ def test_compose_validates_public_entries_at_configuration_time() -> None:
         server.compose(cast(Any, (method, {})))
     with pytest.raises(ValueError, match="unsupported compose option"):
         server.compose(cast(Any, (method, {"amount": "1", "ammount": "1"})))
+    with pytest.raises(ValueError, match=r"meta must be a dict\[str, str\]"):
+        server.compose(cast(Any, (method, {"amount": "1", "meta": {"plan": 1}})))
     with pytest.raises(ValueError, match="does not support refund"):
         server.compose(cast(Any, ("first/refund", {"amount": "1"})))
     with pytest.raises(ValueError, match="unknown payment method"):
@@ -286,6 +289,156 @@ async def test_static_nested_compose_preserves_cross_instance_ownership(
     assert first_method.intent.settlements == 0
     assert first_events == []
     assert len(second_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_meta_disambiguates_wire_identical_cross_instance_offers() -> None:
+    first_method = MockMethod("shared", reference="first")
+    second_method = MockMethod("shared", reference="second")
+    first = Mpp.create(
+        method=first_method,
+        realm="shared.example.com",
+        secret_key="shared-secret",
+    )
+    second = Mpp.create(
+        method=second_method,
+        realm="shared.example.com",
+        secret_key="shared-secret",
+    )
+    configured = compose(
+        first.compose((first_method, {"amount": "1.00", "meta": {"plan": "first"}})),
+        second.compose((second_method, {"amount": "1.00", "meta": {"plan": "second"}})),
+    )
+
+    unpaid = await configured.verify(None)
+    assert isinstance(unpaid, ComposedChallenges)
+    assert [challenge.opaque for challenge in unpaid.challenges] == [
+        {"plan": "first"},
+        {"plan": "second"},
+    ]
+
+    paid = await configured.verify(credential(unpaid.challenges[1]).to_authorization())
+    assert not isinstance(paid, ComposedChallenges)
+    assert paid[1].reference == "second"
+    assert first_method.intent.settlements == 0
+    assert second_method.intent.settlements == 1
+
+
+@pytest.mark.asyncio
+async def test_wire_identical_cross_instance_offers_fail_closed() -> None:
+    first_method = MockMethod("shared", reference="first")
+    second_method = MockMethod("shared", reference="second")
+    first = Mpp.create(
+        method=first_method,
+        realm="shared.example.com",
+        secret_key="shared-secret",
+    )
+    second = Mpp.create(
+        method=second_method,
+        realm="shared.example.com",
+        secret_key="shared-secret",
+    )
+    configured = compose(
+        first.compose((first_method, {"amount": "1.00"})),
+        second.compose((second_method, {"amount": "1.00"})),
+    )
+
+    unpaid = await configured.verify(None)
+    assert isinstance(unpaid, ComposedChallenges)
+    rejected = await configured.verify(credential(unpaid.challenges[1]).to_authorization())
+
+    assert isinstance(rejected, ComposedChallenges)
+    assert len(rejected.challenges) == 2
+    assert first_method.intent.settlements == 0
+    assert second_method.intent.settlements == 0
+
+
+@pytest.mark.asyncio
+async def test_composed_offer_rejects_tampered_opaque() -> None:
+    method = MockMethod("first")
+    server = Mpp.create(
+        method=method,
+        realm="api.example.com",
+        secret_key="shared-secret",
+    )
+    configured = server.compose(
+        (method, {"amount": "1.00", "meta": {"plan": "original"}}),
+    )
+    unpaid = await configured.verify(None)
+    assert isinstance(unpaid, ComposedChallenges)
+    challenge = unpaid.challenges[0]
+    tampered_opaque = (
+        Challenge.create(
+            secret_key="shared-secret",
+            realm=challenge.realm,
+            method=challenge.method,
+            intent=challenge.intent,
+            request=challenge.request,
+            expires=challenge.expires,
+            digest=challenge.digest,
+            meta={"plan": "tampered"},
+        )
+        .to_echo()
+        .opaque
+    )
+    tampered = Credential(
+        challenge=replace(challenge.to_echo(), opaque=tampered_opaque),
+        payload={},
+    )
+
+    rejected = await configured.verify(tampered.to_authorization())
+    assert isinstance(rejected, ComposedChallenges)
+    assert method.intent.settlements == 0
+
+
+@pytest.mark.asyncio
+async def test_compose_rejects_unusable_authorization_without_settlement() -> None:
+    first = MockMethod("first")
+    second = MockMethod("second")
+    server = Mpp.create(
+        methods=[first, second],
+        realm="api.example.com",
+        secret_key="shared-secret",
+    )
+    configured = server.compose(
+        (first, {"amount": "1.00"}),
+        (second, {"amount": "2.00"}),
+    )
+    unpaid = await configured.verify(None)
+    assert isinstance(unpaid, ComposedChallenges)
+    first_challenge = unpaid.challenges[0]
+    unusable = [
+        "Bearer token",
+        "Payment not-base64!!",
+        credential(
+            Challenge.create(
+                secret_key="shared-secret",
+                realm=first_challenge.realm,
+                method="unknown",
+                intent="charge",
+                request=first_challenge.request,
+                expires=first_challenge.expires,
+            )
+        ).to_authorization(),
+        credential(
+            Challenge.create(
+                secret_key="shared-secret",
+                realm=first_challenge.realm,
+                method="first",
+                intent="refund",
+                request=first_challenge.request,
+                expires=first_challenge.expires,
+            )
+        ).to_authorization(),
+    ]
+
+    for authorization in unusable:
+        rejected = await configured.verify(authorization)
+        assert isinstance(rejected, ComposedChallenges)
+        assert len(rejected.challenges) == 2
+
+    assert first.intent.settlements == 0
+    assert second.intent.settlements == 0
 
 
 @pytest.mark.asyncio
