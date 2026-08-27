@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json as _json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -15,6 +15,7 @@ from mpp.server._defaults import detect_realm, detect_secret_key
 from mpp.server.verify import verify_or_challenge
 
 if TYPE_CHECKING:
+    from mpp.server.compose import ComposedResult
     from mpp.server.intent import Intent, VerifiableIntent
 
 R = TypeVar("R")
@@ -120,7 +121,7 @@ def bind_framework_scope(request_params: dict[str, Any], request_obj: Any) -> di
 
 
 def make_challenge_response(
-    challenge: Challenge,
+    challenge: Challenge | Sequence[Challenge],
     realm: str,
     error: PaymentError | None = None,
 ) -> Any:
@@ -129,23 +130,28 @@ def make_challenge_response(
     Returns a Starlette ``Response`` when starlette is installed,
     otherwise a plain dict with ``_mpp_challenge``, ``status``, and ``headers``.
     """
-    error = error or PaymentRequiredError(realm=realm, description=challenge.description)
-    body = _json.dumps(error.to_problem_details(challenge.id))
-    headers = {
-        "WWW-Authenticate": challenge.to_www_authenticate(realm),
+    challenges = (challenge,) if isinstance(challenge, Challenge) else tuple(challenge)
+    error = error or PaymentRequiredError(realm=realm, description=challenges[0].description)
+    body = _json.dumps(error.to_problem_details(challenges[0].id))
+    values = [item.to_www_authenticate(item.realm or realm) for item in challenges]
+    headers: dict[str, Any] = {
         "Cache-Control": "no-store",
         "Content-Type": "application/problem+json",
     }
     try:
         from starlette.responses import Response
 
-        return Response(
+        response = Response(
             content=body,
             status_code=402,
             headers=headers,
             media_type="application/problem+json",
         )
+        for value in values:
+            response.headers.append("WWW-Authenticate", value)
+        return response
     except ImportError:
+        headers["WWW-Authenticate"] = values[0] if len(values) == 1 else values
         return {
             "_mpp_challenge": True,
             "status": 402,
@@ -168,7 +174,7 @@ async def resolve_body_param(body: BodyParamsType, request_obj: Any) -> BodyType
 
 def wrap_payment_handler(
     handler: Callable[..., Awaitable[R]],
-    verify_fn: Callable[[str | None, Any], Awaitable[Challenge | tuple[Credential, Receipt]]],
+    verify_fn: Callable[[str | None, Any], Awaitable[Challenge | ComposedResult]],
     realm_fn: Callable[[], str],
 ) -> Callable[..., Awaitable[R | Any]]:
     """Wrap a handler with the payment challenge/verify flow.
@@ -183,7 +189,7 @@ def wrap_payment_handler(
     Args:
         handler: The async endpoint handler to wrap.
         verify_fn: Called with ``(authorization, request_obj)``; must return
-            a ``Challenge`` or ``(Credential, Receipt)`` tuple.
+            a ``Challenge``, composed challenges, or ``(Credential, Receipt)`` tuple.
         realm_fn: Returns the realm string for challenge responses.
     """
     sig = inspect.signature(handler)
@@ -216,6 +222,11 @@ def wrap_payment_handler(
 
         if isinstance(result, Challenge):
             return make_challenge_response(result, realm_fn())
+
+        from mpp.server.compose import ComposedChallenges
+
+        if isinstance(result, ComposedChallenges):
+            return make_challenge_response(result.challenges, result.challenges[0].realm)
 
         credential, receipt = result
         return await handler(request_obj, credential, receipt)

@@ -40,6 +40,14 @@ from mpp.events import (
     PaymentEvent,
     PaymentEventName,
 )
+from mpp.server.compose import (
+    ComposedChallenges,
+    ComposedHandler,
+    ComposedResult,
+    ComposeEntry,
+    ComposeOptions,
+    compose,
+)
 from mpp.server.decorator import pay
 from mpp.server.intent import (
     Intent,
