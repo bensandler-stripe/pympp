@@ -57,6 +57,7 @@ def make_bound_credential(
     expires: str | None = None,
     digest: str | None = None,
     meta: dict[str, str] | None = None,
+    header: str | None = None,
 ) -> Credential:
     """Create a Credential with an HMAC-bound challenge ID for testing.
 
@@ -76,6 +77,7 @@ def make_bound_credential(
         expires=expires,
         digest=digest,
         meta=meta,
+        header=header,
     )
     echo = challenge.to_echo()
     return Credential(challenge=echo, payload=payload, source=source)
@@ -91,8 +93,13 @@ class MockRequest:
         path: str | None = None,
         route: str | None = None,
         query_string: str | None = None,
+        payment_authorization: str | None = None,
     ) -> None:
-        self.headers = {"authorization": authorization} if authorization else {}
+        self.headers: dict[str, str] = {}
+        if authorization:
+            self.headers["authorization"] = authorization
+        if payment_authorization:
+            self.headers["payment-authorization"] = payment_authorization
         self.body = body
         if path is not None:
             self.path = path

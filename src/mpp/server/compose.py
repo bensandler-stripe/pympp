@@ -99,6 +99,7 @@ class _PreparedOffer:
             expires=self.expires,
             body=self.body,
             events=server._events,
+            header=server.credential_header,
         )
 
 
@@ -197,7 +198,13 @@ class ComposedHandler:
         handler: Callable[[Any, Credential, Receipt], Awaitable[R]],
     ) -> Callable[[Any], Awaitable[R | Any]]:
         """Wrap a payment-protected endpoint."""
-        return wrap_payment_handler(handler, self.verify, lambda: self._offers[0].server.realm)
+        server = self._offers[0].server
+        return wrap_payment_handler(
+            handler,
+            self.verify,
+            lambda: server.realm,
+            requires_auth=server.requires_auth,
+        )
 
     @staticmethod
     def _select_offer(

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
-from mpp import Challenge, Credential, Receipt
+from mpp import PAYMENT_AUTHORIZATION_HEADER, Challenge, Credential, Receipt
 from mpp._parsing import ParseError, _b64_decode, _parse_timestamp
 from mpp._units import parse_units, transform_units
 from mpp.errors import (
@@ -98,6 +98,7 @@ class Mpp:
         secret_key: str,
         defaults: dict[str, Any] | None = None,
         store: Store | None = None,
+        requires_auth: bool = False,
     ) -> None:
         """Initialize the payment handler.
 
@@ -110,12 +111,17 @@ class Mpp:
             store: Optional key-value store for replay protection.
                 When provided, automatically wired into intents that
                 accept a ``store`` (e.g., ``ChargeIntent``).
+            requires_auth: When True, challenges advertise
+                ``header="Payment-Authorization"`` so ``Authorization`` remains
+                available for application authentication.
         """
         self.method = method
         self.methods = (method,)
         self.realm = realm
         self.secret_key = secret_key
         self.defaults = defaults or {}
+        self.requires_auth = requires_auth
+        self.credential_header = PAYMENT_AUTHORIZATION_HEADER if requires_auth else None
         self._events = EventDispatcher()
 
         if store is not None:
@@ -370,6 +376,8 @@ class Mpp:
         realm: str | None = None,
         secret_key: str | None = None,
         store: Store | None = None,
+        *,
+        requires_auth: bool = False,
     ) -> Mpp: ...
 
     @classmethod
@@ -381,6 +389,7 @@ class Mpp:
         realm: str | None = None,
         secret_key: str | None = None,
         store: Store | None = None,
+        requires_auth: bool = False,
     ) -> Mpp: ...
 
     @classmethod
@@ -392,6 +401,7 @@ class Mpp:
         store: Store | None = None,
         *,
         methods: Sequence[Method] | None = None,
+        requires_auth: bool = False,
     ) -> Mpp:
         """Create an Mpp instance with smart defaults.
 
@@ -402,6 +412,9 @@ class Mpp:
             secret_key: HMAC secret. Required unless `MPP_SECRET_KEY` is set.
             store: Optional key-value store for replay protection.
                 Automatically wired into intents that accept a store.
+            requires_auth: Uses ``Payment-Authorization`` for Payment credentials
+                so ``Authorization`` remains available for application
+                authentication.
         """
         if method is not None and methods is not None:
             raise ValueError("pass method= or methods=, not both")
@@ -421,6 +434,7 @@ class Mpp:
             realm=resolved_realm,
             secret_key=resolved_secret_key,
             store=store,
+            requires_auth=requires_auth,
         )
         if len(configured) > 1:
             server.methods = configured
@@ -438,6 +452,18 @@ class Mpp:
 
         return _configure_entries(self, entries, body)
 
+    def payment_credential_value(
+        self,
+        authorization: str | None,
+        payment_authorization: str | None = None,
+    ) -> str | None:
+        """Select the HTTP header value that carries the Payment credential.
+
+        When ``requires_auth`` is True, Payment credentials ride in
+        ``Payment-Authorization`` so ``Authorization`` can hold application auth.
+        """
+        return payment_authorization if self.requires_auth else authorization
+
     async def charge(
         self,
         authorization: str | None,
@@ -453,6 +479,7 @@ class Mpp:
         chain_id: int | None = None,
         extra: dict[str, str] | None = None,
         body: str | bytes | dict[str, Any] | None = None,
+        payment_authorization: str | None = None,
     ) -> Challenge | ComposedResult:
         """Handle a charge intent.
 
@@ -473,6 +500,8 @@ class Mpp:
             body: Actual request body bytes, string, or JSON-like dict to bind
                 with a SHA-256 digest. If provided, new challenges include a
                 digest and submitted credentials must echo a matching digest.
+            payment_authorization: The Payment-Authorization header value.
+                Used when the server was created with ``requires_auth=True``.
 
         Returns:
             Challenge, or ComposedChallenges for multiple methods, if payment
@@ -497,13 +526,13 @@ class Mpp:
             return await self.compose(
                 *((method, options) for method in methods),
                 body=body,
-            ).verify(authorization)
+            ).verify(self.payment_credential_value(authorization, payment_authorization))
 
         intent, request, challenge_expires = self._build_offer_request(
             methods[0], "charge", options, None, api_name="charge"
         )
         return await verify_or_challenge(
-            authorization=authorization,
+            authorization=self.payment_credential_value(authorization, payment_authorization),
             intent=intent,
             request=request,
             realm=self.realm,
@@ -513,6 +542,7 @@ class Mpp:
             expires=challenge_expires,
             body=body,
             events=self._events,
+            header=self.credential_header,
         )
 
     def pay(
@@ -607,9 +637,12 @@ class Mpp:
                     expires=challenge_expires,
                     body=await resolve_body_param(body, _request_obj),
                     events=self._events,
+                    header=self.credential_header,
                 )
 
-            return wrap_payment_handler(handler, _verify, lambda: self.realm)
+            return wrap_payment_handler(
+                handler, _verify, lambda: self.realm, requires_auth=self.requires_auth
+            )
 
         return decorator
 

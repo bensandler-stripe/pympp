@@ -102,9 +102,9 @@ def parse_www_authenticate(header: str) -> Challenge:
     Expected format (per IETF draft-ietf-httpauth-payment):
         Payment id="...", realm="...", method="...", intent="...", request="<base64url>"
 
-    Optional parameters: digest, expires, description
+    Optional parameters: digest, expires, description, header, opaque
     """
-    from mpp import Challenge
+    from mpp import Challenge, advertised_credential_header
 
     header = header.strip()
 
@@ -145,6 +145,11 @@ def parse_www_authenticate(header: str) -> Challenge:
     if opaque_b64:
         opaque = _b64_decode(opaque_b64)
 
+    try:
+        credential_header = advertised_credential_header(params.get("header"))
+    except ValueError as error:
+        raise ParseError(str(error)) from error
+
     return Challenge(
         id=id_,
         method=method,
@@ -156,6 +161,7 @@ def parse_www_authenticate(header: str) -> Challenge:
         expires=params.get("expires"),
         description=params.get("description"),
         opaque=opaque,
+        header=credential_header,
     )
 
 
@@ -184,6 +190,8 @@ def format_www_authenticate(challenge: Challenge, realm: str) -> str:
         parts.append(f'expires="{_escape_quoted(challenge.expires)}"')
     if challenge.description:
         parts.append(f'description="{_escape_quoted(challenge.description)}"')
+    if challenge.header:
+        parts.append(f'header="{_escape_quoted(challenge.header)}"')
     if challenge.opaque is not None:
         opaque_b64 = _b64_encode(challenge.opaque)
         parts.append(f'opaque="{opaque_b64}"')
@@ -202,7 +210,7 @@ def parse_authorization(header: str) -> Credential:
         - payload: Method-specific credential data
         - source: Optional payer DID
     """
-    from mpp import ChallengeEcho, Credential
+    from mpp import ChallengeEcho, Credential, advertised_credential_header
 
     header = header.strip()
 
@@ -226,6 +234,13 @@ def parse_authorization(header: str) -> Credential:
     method = str(challenge_data.get("method", ""))
     _validate_payment_method_id(method)
 
+    try:
+        credential_header = advertised_credential_header(
+            str(challenge_data["header"]) if challenge_data.get("header") else None
+        )
+    except ValueError as error:
+        raise ParseError(str(error)) from error
+
     echo = ChallengeEcho(
         id=str(challenge_data["id"]),
         realm=str(challenge_data.get("realm", "")),
@@ -235,6 +250,7 @@ def parse_authorization(header: str) -> Credential:
         expires=str(challenge_data["expires"]) if challenge_data.get("expires") else None,
         digest=str(challenge_data["digest"]) if challenge_data.get("digest") else None,
         opaque=str(challenge_data["opaque"]) if challenge_data.get("opaque") else None,
+        header=credential_header,
     )
 
     return Credential(
@@ -266,6 +282,8 @@ def format_authorization(credential: Credential) -> str:
         challenge_dict["expires"] = credential.challenge.expires
     if credential.challenge.digest:
         challenge_dict["digest"] = credential.challenge.digest
+    if credential.challenge.header:
+        challenge_dict["header"] = credential.challenge.header
     if credential.challenge.opaque is not None:
         challenge_dict["opaque"] = credential.challenge.opaque
 

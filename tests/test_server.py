@@ -2,7 +2,7 @@
 
 import pytest
 
-from mpp import BodyDigest, Challenge, Credential, Receipt
+from mpp import PAYMENT_AUTHORIZATION_HEADER, BodyDigest, Challenge, Credential, Receipt
 from mpp.errors import VerificationFailedError
 from mpp.events import EventDispatcher
 from mpp.server import Mpp, intent, pay, verify_or_challenge
@@ -673,8 +673,16 @@ class TestCrossEndpointReplay:
 class DjangoStyleRequest:
     """Mock Django-style request object for testing."""
 
-    def __init__(self, authorization: str | None = None) -> None:
-        self.META = {"HTTP_AUTHORIZATION": authorization} if authorization else {}
+    def __init__(
+        self,
+        authorization: str | None = None,
+        payment_authorization: str | None = None,
+    ) -> None:
+        self.META: dict[str, str] = {}
+        if authorization:
+            self.META["HTTP_AUTHORIZATION"] = authorization
+        if payment_authorization:
+            self.META["HTTP_PAYMENT_AUTHORIZATION"] = payment_authorization
 
 
 class TestWrapPaymentHandler:
@@ -1141,7 +1149,7 @@ class TestPay:
         assert challenge.method == "custompay"
 
 
-def _make_server(test_intent):
+def _make_server(test_intent, *, requires_auth: bool = False):
     """Create an Mpp instance with a mock method for testing."""
 
     class MockMethod:
@@ -1158,6 +1166,7 @@ def _make_server(test_intent):
         method=MockMethod(),
         realm="api.example.com",
         secret_key="test-secret",
+        requires_auth=requires_auth,
     )
 
 
@@ -2372,3 +2381,107 @@ class TestCrossRealmPrevention:
         assert isinstance(result, tuple), "Should accept matching credential"
         _, receipt = result
         assert receipt.reference == "0xOK"
+
+
+class TestRequiresAuth:
+    @pytest.mark.asyncio
+    async def test_charge_advertises_payment_authorization_header(self) -> None:
+        @intent(name="charge")
+        async def test_intent(credential: Credential, request: dict) -> Receipt:
+            return Receipt.success("0x123")
+
+        server = _make_server(test_intent, requires_auth=True)
+        result = await server.charge(authorization="Bearer app-token", amount="0.50")
+
+        assert isinstance(result, Challenge)
+        assert result.header == PAYMENT_AUTHORIZATION_HEADER
+        assert f'header="{PAYMENT_AUTHORIZATION_HEADER}"' in result.to_www_authenticate(
+            server.realm
+        )
+
+    @pytest.mark.asyncio
+    async def test_charge_verifies_payment_authorization_and_ignores_bearer(self) -> None:
+        @intent(name="charge")
+        async def test_intent(credential: Credential, request: dict) -> Receipt:
+            return Receipt.success("0x123")
+
+        server = _make_server(test_intent, requires_auth=True)
+        challenge = await server.charge(authorization="Bearer app-token", amount="0.50")
+        assert isinstance(challenge, Challenge)
+        credential = Credential(challenge=challenge.to_echo(), payload={"type": "test"})
+
+        ignored = await server.charge(
+            authorization=credential.to_authorization(),
+            amount="0.50",
+        )
+        assert isinstance(ignored, Challenge)
+
+        paid = await server.charge(
+            authorization="Bearer app-token",
+            amount="0.50",
+            payment_authorization=credential.to_authorization(),
+        )
+        assert isinstance(paid, tuple)
+        assert paid[1].status == "success"
+
+    @pytest.mark.asyncio
+    async def test_pay_decorator_reads_payment_authorization(self) -> None:
+        @intent(name="charge")
+        async def test_intent(credential: Credential, request: dict) -> Receipt:
+            return Receipt.success("0x123")
+
+        server = _make_server(test_intent, requires_auth=True)
+
+        @server.pay(amount="0.50")
+        async def handler(req: MockRequest, credential: Credential, receipt: Receipt) -> dict:
+            return {"paid": True, "ref": receipt.reference}
+
+        challenge_result = await handler(MockRequest(authorization="Bearer app-token"))
+        challenge = challenge_from_402(challenge_result)
+        assert challenge.header == PAYMENT_AUTHORIZATION_HEADER
+
+        credential = make_bound_credential(
+            payload={},
+            request=challenge.request,
+            realm="api.example.com",
+            secret_key="test-secret",
+            expires=challenge.expires,
+            header=PAYMENT_AUTHORIZATION_HEADER,
+        )
+        result = await handler(
+            MockRequest(
+                authorization="Bearer app-token",
+                payment_authorization=credential.to_authorization(),
+            )
+        )
+        assert result == {"paid": True, "ref": "0x123"}
+
+    @pytest.mark.asyncio
+    async def test_standalone_pay_requires_auth(self) -> None:
+        @intent(name="charge")
+        async def test_intent(credential: Credential, request: dict) -> Receipt:
+            return Receipt.success("0x123")
+
+        @pay(
+            intent=test_intent,
+            request={"amount": "1000"},
+            realm="api.example.com",
+            secret_key="test-secret",
+            requires_auth=True,
+        )
+        async def handler(req: MockRequest, credential: Credential, receipt: Receipt) -> dict:
+            return {"paid": True}
+
+        challenge_result = await handler(MockRequest(authorization="Bearer app-token"))
+        challenge = challenge_from_402(challenge_result)
+        assert challenge.header == PAYMENT_AUTHORIZATION_HEADER
+
+        credential = make_bound_credential(
+            payload={},
+            request={"amount": "1000"},
+            realm="api.example.com",
+            secret_key="test-secret",
+            header=PAYMENT_AUTHORIZATION_HEADER,
+        )
+        result = await handler(MockRequest(payment_authorization=credential.to_authorization()))
+        assert result == {"paid": True}

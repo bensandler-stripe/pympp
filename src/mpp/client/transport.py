@@ -4,7 +4,7 @@ Implements automatic 402 Payment Required handling by:
 1. Sending the initial request
 2. If 402, parsing the WWW-Authenticate challenge
 3. Finding a matching method to create credentials
-4. Retrying with the Authorization header
+4. Retrying with the credential header selected by the challenge
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from mpp import Challenge, Credential
+from mpp import AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER, Challenge, Credential
 from mpp._parsing import ParseError
 from mpp.errors import (
     InvalidChallengeError,
@@ -41,6 +41,22 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAX_PAYMENT_RETRIES = 3
 _ORIGINAL_ORIGIN_EXTENSION = "mpp.original_origin"
+_CREDENTIAL_HEADERS = (AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER)
+
+
+def _set_payment_credential(headers: httpx.Headers, header: str, value: str) -> None:
+    """Attach a Payment credential, preserving ordinary Authorization values."""
+    for stale in _CREDENTIAL_HEADERS:
+        existing = headers.get(stale)
+        if (
+            existing is not None
+            and stale.lower() == AUTHORIZATION_HEADER.lower()
+            and not existing.startswith("Payment ")
+        ):
+            continue
+        if existing is not None:
+            del headers[stale]
+    headers[header] = value
 
 
 def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
@@ -252,7 +268,7 @@ class PaymentTransport(httpx.AsyncBaseTransport):
                 raise
 
             headers = httpx.Headers(request.headers)
-            headers["Authorization"] = auth_header
+            _set_payment_credential(headers, challenge.credential_header, auth_header)
             retry_request = httpx.Request(
                 method=request.method,
                 url=request.url,

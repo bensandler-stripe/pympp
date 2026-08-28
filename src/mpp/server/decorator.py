@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from mpp import Challenge, Credential, Receipt
+from mpp import PAYMENT_AUTHORIZATION_HEADER, Challenge, Credential, Receipt
 from mpp.errors import PaymentError, PaymentRequiredError
 from mpp.events import EventDispatcher
 from mpp.server._defaults import detect_realm, detect_secret_key
@@ -31,10 +31,29 @@ def get_authorization(request: Any) -> str | None:
     Supports Starlette/FastAPI (request.headers), Django (request.META),
     and any object with a ``headers`` dict-like attribute.
     """
+    return get_header(request, "authorization")
+
+
+def get_payment_authorization(request: Any) -> str | None:
+    """Extract Payment-Authorization header from various request types."""
+    return get_header(request, "payment-authorization")
+
+
+def get_header(request: Any, name: str) -> str | None:
+    """Extract an HTTP header from various request types.
+
+    Supports Starlette/FastAPI (request.headers), Django (request.META),
+    and any object with a ``headers`` dict-like attribute.
+    """
+    canonical = "-".join(part.capitalize() for part in name.split("-"))
     if hasattr(request, "headers"):
-        return request.headers.get("authorization") or request.headers.get("Authorization")
+        return (
+            request.headers.get(name)
+            or request.headers.get(name.lower())
+            or request.headers.get(canonical)
+        )
     if hasattr(request, "META"):
-        return request.META.get("HTTP_AUTHORIZATION")
+        return request.META.get("HTTP_" + name.upper().replace("-", "_"))
     return None
 
 
@@ -176,6 +195,8 @@ def wrap_payment_handler(
     handler: Callable[..., Awaitable[R]],
     verify_fn: Callable[[str | None, Any], Awaitable[Challenge | ComposedResult]],
     realm_fn: Callable[[], str],
+    *,
+    requires_auth: bool = False,
 ) -> Callable[..., Awaitable[R | Any]]:
     """Wrap a handler with the payment challenge/verify flow.
 
@@ -191,6 +212,8 @@ def wrap_payment_handler(
         verify_fn: Called with ``(authorization, request_obj)``; must return
             a ``Challenge``, composed challenges, or ``(Credential, Receipt)`` tuple.
         realm_fn: Returns the realm string for challenge responses.
+        requires_auth: When True, read the Payment credential from
+            ``Payment-Authorization`` instead of ``Authorization``.
     """
     sig = inspect.signature(handler)
     params = [p for name, p in sig.parameters.items() if name not in ("credential", "receipt")]
@@ -211,7 +234,11 @@ def wrap_payment_handler(
                 "The decorated handler must receive a request object as its first argument."
             )
 
-        authorization = get_authorization(request_obj)
+        authorization = (
+            get_payment_authorization(request_obj)
+            if requires_auth
+            else get_authorization(request_obj)
+        )
 
         try:
             result = await verify_fn(authorization, request_obj)
@@ -246,6 +273,7 @@ def pay(
     description: str | None = None,
     body: BodyParamsType = None,
     events: EventDispatcher | None = None,
+    requires_auth: bool = False,
 ) -> Callable[
     [Callable[[Any, Credential, Receipt], Awaitable[R]]],
     Callable[[Any], Awaitable[R | Any]],
@@ -274,6 +302,9 @@ def pay(
         body: Optional static body bytes/string/dict or callback receiving the
             request object. The resolved value is bound into issued challenges
             via digest and used to verify paid retries.
+        requires_auth: When True, challenges advertise
+            ``header="Payment-Authorization"`` and credentials are read from
+            that header so ``Authorization`` can carry application auth.
 
     Example:
         @app.get("/resource")
@@ -310,8 +341,11 @@ def pay(
                 description=description,
                 body=await resolve_body_param(body, request_obj),
                 events=events,
+                header=PAYMENT_AUTHORIZATION_HEADER if requires_auth else None,
             )
 
-        return wrap_payment_handler(handler, _verify, lambda: resolved_realm)
+        return wrap_payment_handler(
+            handler, _verify, lambda: resolved_realm, requires_auth=requires_auth
+        )
 
     return decorator

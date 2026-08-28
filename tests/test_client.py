@@ -135,6 +135,39 @@ class TestPaymentTransport:
         method.create_credential.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_retry_uses_advertised_payment_authorization_header(self) -> None:
+        challenge = Challenge(
+            id="test-id",
+            method="tempo",
+            intent="charge",
+            request={"amount": "1000"},
+            header="Payment-Authorization",
+        )
+        www_auth = challenge.to_www_authenticate("example.com")
+
+        inner = MockTransport(
+            [
+                httpx.Response(402, headers={"www-authenticate": www_auth}),
+                httpx.Response(200, content=b'{"data": "ok"}'),
+            ]
+        )
+        method = MockMethod()
+        transport = PaymentTransport(methods=[method], inner=inner)
+
+        request = httpx.Request(
+            "GET",
+            "https://example.com",
+            headers={"Authorization": "Bearer app-token"},
+        )
+        response = await transport.handle_async_request(request)
+
+        assert response.status_code == 200
+        retry_request = inner.requests[1]
+        assert retry_request.headers["Authorization"] == "Bearer app-token"
+        assert retry_request.headers["Payment-Authorization"].startswith("Payment ")
+        method.create_credential.assert_called_once()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "target_url",
         [

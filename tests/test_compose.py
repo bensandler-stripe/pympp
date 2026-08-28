@@ -493,3 +493,32 @@ async def test_repeated_offers_keep_body_hmac_and_route_scope_bindings() -> None
     assert paid[1].reference == "first"
     assert method.intent.settlements == 1
     assert len(failures) == 3
+
+
+@pytest.mark.asyncio
+async def test_requires_auth_compose_advertises_and_accepts_payment_authorization() -> None:
+    first = MockMethod("first")
+    second = MockMethod("second")
+    server = Mpp.create(
+        methods=[first, second],
+        realm="api.example.com",
+        secret_key="secret",
+        requires_auth=True,
+    )
+    configured = server.compose(
+        (first, {"amount": "1.00"}),
+        (second, {"amount": "1.00"}),
+    )
+
+    unpaid = await configured.verify("Bearer app-token")
+    assert isinstance(unpaid, ComposedChallenges)
+    assert all(challenge.header == "Payment-Authorization" for challenge in unpaid.challenges)
+    assert all(
+        'header="Payment-Authorization"' in challenge.to_www_authenticate(server.realm)
+        for challenge in unpaid.challenges
+    )
+
+    paid = await configured.verify(credential(unpaid.challenges[1]).to_authorization())
+    assert not isinstance(paid, ComposedChallenges)
+    assert paid[1].reference == "second"
+    assert second.intent.settlements == 1

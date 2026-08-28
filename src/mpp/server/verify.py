@@ -44,6 +44,7 @@ async def verify_or_challenge(
     expires: str | None = None,
     body: str | bytes | dict[str, Any] | None = None,
     events: EventDispatcher | None = None,
+    header: str | None = None,
 ) -> Challenge | tuple[Credential, Receipt]:
     """Verify a payment credential or generate a new challenge.
 
@@ -73,6 +74,9 @@ async def verify_or_challenge(
             a SHA-256 digest. If provided, new challenges include a digest and
             submitted credentials must echo a matching digest.
         events: Optional dispatcher for challenge/payment lifecycle events.
+        header: Optional HTTP field for the Payment credential. When set to
+            ``Payment-Authorization``, issued challenges advertise that field
+            so ``Authorization`` can carry application authentication.
 
     Returns:
         If no valid Authorization header:
@@ -106,7 +110,16 @@ async def verify_or_challenge(
 
     async def new_challenge() -> Challenge:
         challenge = _create_challenge(
-            method_name, intent.name, request, realm, secret_key, description, meta, expires, body
+            method_name,
+            intent.name,
+            request,
+            realm,
+            secret_key,
+            description,
+            meta,
+            expires,
+            body,
+            header,
         )
         if events is not None:
             await events.emit(
@@ -269,6 +282,7 @@ def _authenticate_echo(
         expires=echo.expires,
         digest=echo.digest,
         opaque=echo_opaque,
+        header=echo.header,
     )
     if not _constant_time_equal(echo.id, expected_id):
         raise InvalidChallengeError(echo.id, "challenge was not issued by this server")
@@ -285,6 +299,7 @@ def _create_challenge(
     meta: dict[str, str] | None = None,
     expires: str | None = None,
     body: str | bytes | dict[str, Any] | None = None,
+    header: str | None = None,
 ) -> Challenge:
     """Create a new payment challenge with HMAC-bound ID.
 
@@ -312,6 +327,7 @@ def _create_challenge(
         digest=digest,
         description=description,
         meta=meta,
+        header=header,
     )
 
 
@@ -345,6 +361,7 @@ def _challenge_from_echo(
         expires=echo.expires,
         digest=echo.digest,
         opaque=opaque,
+        header=echo.header,
     )
 
 

@@ -173,6 +173,47 @@ class TestChallenge:
         with pytest.raises(ParseError, match="invalid CRLF"):
             challenge.to_www_authenticate("api.example.com")
 
+    def test_www_authenticate_roundtrip_preserves_credential_header(self) -> None:
+        challenge = Challenge.create(
+            secret_key="test-secret",
+            realm="api.example.com",
+            method="tempo",
+            intent="charge",
+            request={"amount": "1000000"},
+            header="Payment-Authorization",
+        )
+        header = challenge.to_www_authenticate("api.example.com")
+        parsed = Challenge.from_www_authenticate(header)
+
+        assert 'header="Payment-Authorization"' in header
+        assert parsed.header == "Payment-Authorization"
+        assert parsed.credential_header == "Payment-Authorization"
+        assert parsed.verify("test-secret", "api.example.com")
+
+    def test_www_authenticate_omits_default_authorization_header(self) -> None:
+        challenge = Challenge.create(
+            secret_key="test-secret",
+            realm="api.example.com",
+            method="tempo",
+            intent="charge",
+            request={"amount": "1000000"},
+            header="authorization",
+        )
+        header = challenge.to_www_authenticate("api.example.com")
+
+        assert "header=" not in header
+        assert challenge.header is None
+
+    def test_parse_www_authenticate_rejects_invalid_header_name(self) -> None:
+        request_b64 = _b64_json({"amount": "1000000"})
+        header = (
+            'Payment id="abc", realm="api.example.com", method="tempo", '
+            f'intent="charge", request="{request_b64}", header="not a header"'
+        )
+
+        with pytest.raises(ParseError, match="Invalid HTTP header name"):
+            Challenge.from_www_authenticate(header)
+
 
 class TestCredential:
     def test_roundtrip(self) -> None:
@@ -292,6 +333,23 @@ class TestCredential:
 
         assert parsed.challenge.digest == credential.challenge.digest
         assert parsed.challenge.opaque == credential.challenge.opaque
+
+    def test_roundtrip_preserves_header(self) -> None:
+        echo = ChallengeEcho(
+            id="test-id",
+            realm="api.example.com",
+            method="tempo",
+            intent="charge",
+            request="eyJhbW91bnQiOiIxMDAwMDAwIn0",
+            header="Payment-Authorization",
+        )
+        credential = Credential(
+            challenge=echo,
+            payload={"type": "transaction", "signature": "0xabc"},
+        )
+        parsed = Credential.from_authorization(credential.to_authorization())
+
+        assert parsed.challenge.header == "Payment-Authorization"
 
 
 class TestReceipt:

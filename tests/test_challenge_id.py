@@ -4,6 +4,8 @@ These tests use the cross-SDK conformance test vectors to ensure
 Python SDK produces identical challenge IDs to TypeScript and Rust SDKs.
 """
 
+import pytest
+
 from mpp import Challenge, generate_challenge_id
 
 
@@ -504,3 +506,70 @@ class TestOpaque:
             meta={},
         )
         assert challenge.opaque == {}
+
+
+class TestCredentialHeader:
+    """HMAC binding and serialization of the optional credential header."""
+
+    def test_authorization_header_does_not_change_challenge_id(self) -> None:
+        params = {
+            "secret_key": "test-secret-key-12345",
+            "realm": "api.example.com",
+            "method": "tempo",
+            "intent": "charge",
+            "request": {"amount": "1000000"},
+        }
+        implicit = Challenge.create(**params)
+        explicit = Challenge.create(**params, header="Authorization")
+
+        assert implicit.header is None
+        assert explicit.header is None
+        assert implicit.id == explicit.id
+        assert "header=" not in implicit.to_www_authenticate("api.example.com")
+        assert implicit.credential_header == "Authorization"
+
+    def test_payment_authorization_header_is_bound_into_id(self) -> None:
+        params = {
+            "secret_key": "test-secret-key-12345",
+            "realm": "api.example.com",
+            "method": "tempo",
+            "intent": "charge",
+            "request": {"amount": "1000000"},
+        }
+        implicit = Challenge.create(**params)
+        advertised = Challenge.create(**params, header="Payment-Authorization")
+
+        assert implicit.id != advertised.id
+        assert advertised.header == "Payment-Authorization"
+        assert advertised.verify("test-secret-key-12345", "api.example.com")
+        assert 'header="Payment-Authorization"' in advertised.to_www_authenticate("api.example.com")
+
+    def test_header_sits_before_opaque_in_hmac(self) -> None:
+        """Header is inserted immediately before the final opaque slot."""
+        params = {
+            "secret_key": "test-secret",
+            "realm": "api.example.com",
+            "method": "tempo",
+            "intent": "charge",
+            "request": {"amount": "1000000"},
+        }
+        with_header = Challenge.create(**params, header="Payment-Authorization")
+        with_both = Challenge.create(
+            **params, header="Payment-Authorization", meta={"pi": "pi_123"}
+        )
+        with_opaque = Challenge.create(**params, meta={"pi": "pi_123"})
+
+        assert with_header.id != with_both.id
+        assert with_both.id != with_opaque.id
+        assert with_both.verify("test-secret", "api.example.com")
+
+    def test_rejects_invalid_header_name(self) -> None:
+        with pytest.raises(ValueError, match="Invalid HTTP header name"):
+            Challenge.create(
+                secret_key="test-secret",
+                realm="api.example.com",
+                method="tempo",
+                intent="charge",
+                request={"amount": "1000000"},
+                header="Payment Authorization",
+            )
