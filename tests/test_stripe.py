@@ -21,6 +21,7 @@ from mpp.errors import (
     VerificationFailedError,
 )
 from mpp.methods.stripe import ChargeIntent, stripe
+from mpp.methods.stripe._defaults import MACHINE_PAYMENTS_API_VERSION
 from mpp.methods.stripe.client import OnChallengeParameters
 from mpp.methods.stripe.intents import _resolve_payment_intents
 from mpp.methods.stripe.schemas import ChargeRequest, StripeCredentialPayload
@@ -644,8 +645,6 @@ class TestChargeIntent:
 
         params = captured[0][0][0]
         metadata = params["metadata"]
-        assert metadata["mpp_version"] == "1"
-        assert metadata["mpp_is_mpp"] == "true"
         assert metadata["mpp_intent"] == "charge"
         assert metadata["mpp_challenge_id"] == "test-challenge-id"
         assert metadata["mpp_server_id"] == "api.example.com"
@@ -671,6 +670,10 @@ class TestChargeIntent:
 
         options = captured[0][1]["options"]
         assert options["idempotency_key"] == "mpp_test-challenge-id_spt_test_xyz"
+        assert options["headers"] == {
+            "X-Request-Source": 'service="pympp"; project="machine_payments"'
+        }
+        assert options["stripe_version"] == MACHINE_PAYMENTS_API_VERSION
 
     @pytest.mark.asyncio
     async def test_client_request_body_is_first_positional_arg(self):
@@ -763,6 +766,8 @@ class TestChargeIntentRawHttp:
         expected_auth = base64.b64encode(b"sk_test_raw:").decode()
         assert headers["Authorization"] == f"Basic {expected_auth}"
         assert headers["Idempotency-Key"] == "mpp_test-challenge-id_spt_test_abc"
+        assert headers["Stripe-Version"] == MACHINE_PAYMENTS_API_VERSION
+        assert headers["X-Request-Source"] == 'service="pympp"; project="machine_payments"'
 
         data = call_kwargs.kwargs["data"]
         assert data["amount"] == "150"
@@ -841,8 +846,7 @@ class TestChargeIntentRawHttp:
 
         data = mock_client.post.call_args.kwargs["data"]
         assert data["metadata[machine_payment]"] == "true"
-        assert data["metadata[mpp_is_mpp]"] == "true"
-        assert data["metadata[mpp_version]"] == "1"
+        assert data["metadata[mpp_intent]"] == "charge"
 
 
 # ──────────────────────────────────────────────────────────────────

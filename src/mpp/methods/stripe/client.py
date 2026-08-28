@@ -70,6 +70,7 @@ class StripeMethod:
     _intents: dict[str, Intent | VerifiableIntent] = field(default_factory=dict)
     can_offer: CanOfferFn | None = field(default=None, kw_only=True)
     on_payment_success: PaymentSuccessHandler | None = field(default=None, kw_only=True)
+    metadata: dict[str, str] | None = field(default=None, kw_only=True)
 
     @property
     def intents(self) -> dict[str, Intent | VerifiableIntent]:
@@ -97,6 +98,8 @@ class StripeMethod:
                 )
         if self.payment_method_types:
             method_details["paymentMethodTypes"] = self.payment_method_types
+        if self.metadata is not None:
+            method_details["metadata"] = self.metadata
         request = {**request, "methodDetails": method_details}
         if self.external_id and "externalId" not in request:
             request["externalId"] = self.external_id
@@ -199,6 +202,7 @@ def stripe(
     payment_method_types: list[str] | None = None,
     can_offer: CanOfferFn | None = None,
     on_payment_success: PaymentSuccessHandler | None = None,
+    metadata: dict[str, str] | None = None,
 ) -> StripeMethod:
     """Create a Stripe payment method.
 
@@ -219,6 +223,7 @@ def stripe(
             Included in challenge ``methodDetails.paymentMethodTypes``.
         can_offer: Optional callback that filters this method's composed offers.
         on_payment_success: Optional callback invoked after successful verification.
+        metadata: Optional Stripe metadata included in the challenge request.
 
     Returns:
         A configured :class:`StripeMethod` instance.
@@ -253,6 +258,7 @@ def stripe(
         payment_method_types=payment_method_types or ["card"],
         can_offer=can_offer,
         on_payment_success=on_payment_success,
+        metadata=metadata,
     )
     method._intents = dict(intents)
     return method

@@ -3,10 +3,13 @@
 
 from typing import assert_type
 
+from stripe import StripeClient
+
 import mpp.server as server_api
 from mpp import Challenge, Credential, Receipt
 from mpp.events import ServerPaymentSuccessPayload
 from mpp.methods import CanOfferFn, PaymentSuccessHandler
+from mpp.methods.stripe import DepositAddresses, create
 from mpp.methods.tempo import ChargeIntent, tempo
 
 
@@ -44,3 +47,14 @@ server.compose((method, {}))  # pyright: ignore[reportArgumentType]
 server.compose((method, {"amount": 1}))  # pyright: ignore[reportArgumentType]
 server_api.Mpp.create()  # pyright: ignore[reportCallIssue]
 server_api.Mpp.create(method=method, methods=[method])  # pyright: ignore[reportCallIssue]
+
+stripe_client = StripeClient("sk_test")
+deposit_addresses: DepositAddresses = {"tempo": "0x" + "1" * 40}
+machine_payments = create(
+    network_id="bn_test", livemode=False, client=stripe_client, deposit_addresses=deposit_addresses
+)
+machine_payments.spt.charge()
+machine_payments.tempo.charge()
+server_api.Mpp.create(
+    methods=machine_payments.default_methods(), realm="example.com", secret_key="secret"
+)
