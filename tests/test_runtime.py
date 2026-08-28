@@ -18,12 +18,13 @@ def challenge(
     method: str = "tempo",
     intent: str = "charge",
     expires: str | None = None,
+    currency: str | None = None,
 ) -> Challenge:
     return Challenge(
         id=identifier,
         method=method,
         intent=intent,
-        request={},
+        request={} if currency is None else {"currency": currency},
         expires=expires,
     )
 
@@ -33,6 +34,8 @@ class MockMethod:
 
     def __init__(self, *intents: str) -> None:
         self.intents = dict.fromkeys(intents or ("charge",), True)
+        self.currency: str | None = None
+        self._currency_explicit = True
         self.loops: list[asyncio.AbstractEventLoop] = []
 
     async def create_credential(self, challenge: Challenge) -> Credential:
@@ -69,6 +72,47 @@ def test_matching_skips_unsupported_intent_before_supported_challenge() -> None:
     ]
 
     assert runtime.match_challenge(offered) == (offered[1], method)
+
+
+def test_matching_skips_currency_rejected_by_configured_method() -> None:
+    method = MockMethod("charge")
+    method.currency = "0xUsdc"
+    runtime = PaymentRuntime([method])
+    offered = [
+        challenge("machine-usd", currency="0xMachineUsd"),
+        challenge("usdc", currency="0xUSDC"),
+    ]
+
+    assert runtime.match_challenge(offered) == (offered[1], method)
+    with pytest.raises(ValueError, match="No compatible payment method"):
+        runtime.match_challenge(offered[:1])
+
+
+def test_matching_considers_each_same_key_method_currency_constraint() -> None:
+    usdc_method = MockMethod("charge")
+    usdc_method.currency = "0xUsdc"
+    machine_usd_method = MockMethod("charge")
+    machine_usd_method.currency = "0xMachineUsd"
+    runtime = PaymentRuntime([usdc_method, machine_usd_method])
+
+    usdc_challenge = challenge("usdc", currency="0xUSDC")
+    machine_usd_challenge = challenge("machine-usd", currency="0xMACHINEUSD")
+
+    assert runtime.match_challenge([usdc_challenge]) == (usdc_challenge, usdc_method)
+    assert runtime.match_challenge([machine_usd_challenge]) == (
+        machine_usd_challenge,
+        machine_usd_method,
+    )
+
+
+def test_matching_ignores_implicit_currency_default() -> None:
+    method = MockMethod("charge")
+    method.currency = "0xUsdc"
+    method._currency_explicit = False
+    runtime = PaymentRuntime([method])
+    offered = challenge("machine-usd", currency="0xMachineUsd")
+
+    assert runtime.match_challenge([offered]) == (offered, method)
 
 
 def test_matching_preserves_legacy_methods_without_intent_metadata() -> None:
@@ -144,6 +188,17 @@ async def test_credential_creation_validates_method() -> None:
         await runtime.create_credential(challenge(), MockMethod())
     with pytest.raises(ValueError, match="does not support"):
         await runtime.create_credential(challenge(method="stripe"), method)
+
+    assert method.loops == []
+
+
+async def test_credential_creation_rejects_mismatched_currency() -> None:
+    method = MockMethod()
+    method.currency = "0xUsdc"
+    runtime = PaymentRuntime([method])
+
+    with pytest.raises(ValueError, match="currency '0xUsdc' does not support '0xMachineUsd'"):
+        await runtime.create_credential(challenge(currency="0xMachineUsd"), method)
 
     assert method.loops == []
 
