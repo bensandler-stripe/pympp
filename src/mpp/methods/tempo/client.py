@@ -15,11 +15,13 @@ from mpp.methods import CanOfferFn, PaymentSuccessHandler
 from mpp.methods.tempo._attribution import encode as encode_attribution
 from mpp.methods.tempo._defaults import (
     CHAIN_ID,
+    MACH,
     RPC_URL,
     default_currency_for_chain,
+    fee_tokens_for_chain,
     rpc_url_for_chain,
 )
-from mpp.methods.tempo._rpc import _rpc_call, estimate_gas
+from mpp.methods.tempo._rpc import _rpc_call, _tip20_balance, estimate_gas
 from mpp.methods.tempo.fee_payer_policy import get_policy
 
 if TYPE_CHECKING:
@@ -36,6 +38,9 @@ if TYPE_CHECKING:
 DEFAULT_GAS_LIMIT = 1_000_000
 EXPIRING_NONCE_KEY = (1 << 256) - 1  # U256::MAX
 FEE_PAYER_VALID_BEFORE_SECS = 25
+# Tempo gas prices use attodollars (10^-18 USD) while TIP-20 fee tokens use
+# microdollars (10^-6 USD).
+ATTODOLLARS_PER_MICRODOLLAR = 10**12
 _CHAIN_ID_UNSET = object()
 
 
@@ -125,6 +130,25 @@ class TempoMethod:
         if self.rpc_url:
             return await self._get_chain_id(self.rpc_url)
         return None
+
+    async def _resolve_mach_fee_token(
+        self,
+        *,
+        account: str,
+        chain_id: int,
+        rpc_url: str,
+        required_balance: int,
+    ) -> str:
+        """Return a stablecoin that can cover the MACH transaction fee."""
+        for token in fee_tokens_for_chain(chain_id):
+            try:
+                if await _tip20_balance(rpc_url, token, account) >= required_balance:
+                    return token
+            except Exception:
+                continue
+        raise TransactionError(
+            "MACH charges require a funded supported stablecoin for transaction fees"
+        )
 
     async def create_credential(self, challenge: Challenge) -> Credential:
         """Create a credential to satisfy the given challenge.
@@ -229,8 +253,9 @@ class TempoMethod:
     ) -> tuple[str, int]:
         """Build a client-signed Tempo transaction.
 
-        Creates a TempoTransaction (type 0x76) with fee token set to the
-        transfer currency, allowing gas to be paid in the same token.
+        Creates a TempoTransaction (type 0x76) with a supported fee token.
+        Ordinary charges use the transfer currency; MACH charges select a
+        funded supported stablecoin because MACH cannot pay transaction fees.
 
         When ``awaiting_fee_payer`` is True, the transaction is built with
         a fee payer placeholder so a sponsoring service can co-sign it
@@ -331,6 +356,22 @@ class TempoMethod:
         except Exception:
             pass
 
+        fee_token: str | None = None
+        if not awaiting_fee_payer:
+            fee_token = currency
+            if currency.lower() == MACH.lower():
+                required_balance = max(
+                    1,
+                    (gas_limit * gas_price + ATTODOLLARS_PER_MICRODOLLAR - 1)
+                    // ATTODOLLARS_PER_MICRODOLLAR,
+                )
+                fee_token = await self._resolve_mach_fee_token(
+                    account=nonce_address,
+                    chain_id=chain_id,
+                    rpc_url=resolved_rpc,
+                    required_balance=required_balance,
+                )
+
         tx = TempoTransaction.create(
             chain_id=chain_id,
             gas_limit=gas_limit,
@@ -338,7 +379,7 @@ class TempoMethod:
             max_priority_fee_per_gas=max_priority_fee_per_gas,
             nonce=resolved_nonce,
             nonce_key=resolved_nonce_key,
-            fee_token=None if awaiting_fee_payer else currency,
+            fee_token=fee_token,
             awaiting_fee_payer=awaiting_fee_payer,
             valid_before=valid_before,
             calls=calls_tuple,
