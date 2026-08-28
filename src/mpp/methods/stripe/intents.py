@@ -174,7 +174,11 @@ class ChargeIntent:
         spt = parsed.spt
 
         user_metadata = parsed_request.methodDetails.metadata
-        resolved_metadata = {**_build_analytics(credential), **(user_metadata or {})}
+        resolved_metadata = {
+            **_build_analytics(credential),
+            **(user_metadata or {}),
+            "machine_payment": "true",
+        }
 
         if self._client is not None:
             pi = await self._create_with_client(
