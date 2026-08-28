@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar, cast
@@ -12,7 +14,7 @@ from mpp._parsing import ParseError, _b64_decode
 from mpp._units import parse_units
 from mpp.errors import InvalidChallengeError, MalformedCredentialError
 from mpp.server.decorator import BodyParamsType, resolve_body_param, wrap_payment_handler
-from mpp.server.method import Method
+from mpp.server.method import Method, _SupportsCanOffer
 from mpp.server.verify import _authenticate_echo, _extract_payment_scheme, verify_or_challenge
 
 if TYPE_CHECKING:
@@ -83,6 +85,24 @@ class _PreparedOffer:
     request: dict[str, Any]
     expires: str | None
     body: str | bytes | dict[str, Any] | None
+
+    async def is_available(self) -> bool:
+        """Return whether the method wants to advertise this prepared offer."""
+        callback = (
+            self.offer.method.can_offer
+            if isinstance(self.offer.method, _SupportsCanOffer)
+            else None
+        )
+        if callback is None:
+            return True
+        if not callable(callback):
+            raise ValueError("can_offer must be callable")
+        available = callback(deepcopy(self.request))
+        if inspect.isawaitable(available):
+            available = await available
+        if not isinstance(available, bool):
+            raise ValueError("can_offer must return bool")
+        return available
 
     async def verify(self, authorization: str | None) -> Challenge | tuple[Credential, Receipt]:
         """Verify this offer using its originating server."""
@@ -187,10 +207,14 @@ class ComposedHandler:
         challenges: list[Challenge] = []
         for offer in self._offers:
             prepared_offer = await _prepare_offer(offer, request, body_cache)
+            if not await prepared_offer.is_available():
+                continue
             result = await prepared_offer.verify(authorization)
             if not isinstance(result, Challenge):
                 return result
             challenges.append(result)
+        if not challenges:
+            raise ValueError("No payment offers are available for this request")
         return ComposedChallenges(tuple(challenges))
 
     def __call__(
