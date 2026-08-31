@@ -9,7 +9,9 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from functools import wraps
+from typing import TYPE_CHECKING, Any, ParamSpec
+from warnings import warn
 
 from mpp import Challenge, Credential
 from mpp.methods import CanOfferFn, PaymentSuccessHandler
@@ -88,13 +90,13 @@ class StripeMethod:
         method_details = dict(request.get("methodDetails", {}))
         if self.network_id and "networkId" in method_details:
             if method_details["networkId"] != self.network_id:
-                raise ValueError("networkId does not match configured stripe() network_id")
+                raise ValueError("networkId does not match configured spt() network_id")
         if self.network_id:
             method_details["networkId"] = self.network_id
         if self.payment_method_types and "paymentMethodTypes" in method_details:
             if method_details["paymentMethodTypes"] != self.payment_method_types:
                 raise ValueError(
-                    "paymentMethodTypes does not match configured stripe() payment_method_types"
+                    "paymentMethodTypes does not match configured spt() payment_method_types"
                 )
         if self.payment_method_types:
             method_details["paymentMethodTypes"] = self.payment_method_types
@@ -128,7 +130,7 @@ class StripeMethod:
 
         payment_method = self.payment_method
         if not payment_method:
-            raise ValueError("payment_method is required (pass to stripe() or via context)")
+            raise ValueError("payment_method is required (pass to spt() or via context)")
 
         amount = str(request.get("amount", ""))
         currency = str(request.get("currency", ""))
@@ -190,7 +192,7 @@ def _parse_iso_timestamp(iso_str: str) -> float:
 # ──────────────────────────────────────────────────────────────────
 
 
-def stripe(
+def spt(
     intents: Mapping[str, Intent | VerifiableIntent],
     create_token: CreateTokenFn | None = None,
     payment_method: str | None = None,
@@ -229,10 +231,10 @@ def stripe(
         A configured :class:`StripeMethod` instance.
 
     Example:
-        from mpp.methods.stripe import stripe, ChargeIntent
+        from mpp.methods.stripe import spt, ChargeIntent
 
         # Server
-        method = stripe(
+        method = spt(
             network_id="bn_...",
             payment_method_types=["card"],
             currency="usd",
@@ -241,7 +243,7 @@ def stripe(
         )
 
         # Client
-        method = stripe(
+        method = spt(
             create_token=my_spt_proxy,
             payment_method="pm_card_visa",
             intents={"charge": ChargeIntent(secret_key="sk_...")},
@@ -262,3 +264,18 @@ def stripe(
     )
     method._intents = dict(intents)
     return method
+
+
+_P = ParamSpec("_P")
+
+
+def _deprecated_alias(func: Callable[_P, StripeMethod]) -> Callable[_P, StripeMethod]:
+    @wraps(func)
+    def alias(*args: _P.args, **kwargs: _P.kwargs) -> StripeMethod:
+        warn("stripe() is deprecated; use spt()", DeprecationWarning, stacklevel=2)
+        return func(*args, **kwargs)
+
+    return alias
+
+
+stripe = _deprecated_alias(spt)

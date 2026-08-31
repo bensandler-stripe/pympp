@@ -9,7 +9,7 @@ import pytest
 from mpp import Challenge, Credential, Receipt
 from mpp.events import ServerPaymentSuccessPayload
 from mpp.methods import CanOfferFn, PaymentSuccessHandler
-from mpp.methods.stripe import stripe
+from mpp.methods.stripe import spt
 from mpp.methods.tempo import tempo
 from mpp.server import ComposedChallenges, Mpp, compose, intent
 from tests import MockRequest
@@ -237,7 +237,7 @@ def test_method_factories_preserve_hooks() -> None:
     def on_payment_success(_payload: ServerPaymentSuccessPayload) -> None:
         pass
 
-    stripe_method = stripe(
+    stripe_method = spt(
         intents={},
         currency="usd",
         recipient="acct_123",

@@ -10,7 +10,7 @@ import mpp.methods.stripe._defaults as stripe_defaults
 import mpp.methods.stripe.intents as stripe_intents
 from mpp.events import ServerPaymentSuccessPayload
 from mpp.methods import CanOfferFn
-from mpp.methods.stripe.client import StripeMethod, stripe
+from mpp.methods.stripe.client import StripeMethod, spt
 from mpp.methods.tempo._defaults import CHAIN_ID, TESTNET_CHAIN_ID
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ class SptPayments:
         self._metadata = metadata
 
     def charge(self) -> StripeMethod:
-        return stripe(
+        return spt(
             intents={"charge": stripe_intents.ChargeIntent(client=self._client)},
             currency="usd",
             recipient=self._network_id,
