@@ -10,6 +10,8 @@ from mpp.events import ServerPaymentSuccessPayload
 from mpp.methods.stripe import MachinePayments, create
 from mpp.methods.stripe import _defaults as stripe_defaults
 from mpp.methods.tempo._defaults import CHAIN_ID, PATH_USD, TESTNET_CHAIN_ID, USDC
+from mpp.server import Mpp
+from tests import MockRequest
 
 TEMPO_ADDRESS = "0x" + "1" * 40
 
@@ -88,6 +90,31 @@ def test_methods_filter_amounts_below_stripe_minima() -> None:
     assert spt_offer({"amount": "50"})
     assert not tempo_offer({"amount": "9999"})
     assert tempo_offer({"amount": "10000"})
+
+
+@pytest.mark.asyncio
+async def test_spt_only_defaults_enforce_minimum_through_implicit_handlers() -> None:
+    _, payments = make_payments()
+    server = Mpp.create(
+        methods=payments.default_methods(),
+        realm="api.example.com",
+        secret_key="secret",
+    )
+
+    with pytest.raises(ValueError, match="No payment offers"):
+        await server.charge(None, "0.49")
+    assert isinstance(await server.charge(None, "0.50"), Challenge)
+
+    @server.pay(amount="0.49")
+    async def endpoint(
+        _request: MockRequest,
+        _credential: Credential,
+        _receipt: Receipt,
+    ) -> None:
+        return None
+
+    with pytest.raises(ValueError, match="No payment offers"):
+        await endpoint(MockRequest(path="/paid"))
 
 
 def test_configuration_boundary_errors() -> None:

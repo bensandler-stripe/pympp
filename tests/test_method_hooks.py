@@ -107,7 +107,7 @@ async def test_can_offer_checks_repeated_offers_but_not_direct_handlers_or_redem
         return request["amount"] == "200"
 
     method = ThirdPartyMethod("only", can_offer=can_offer)
-    server = create_server(method)
+    server = Mpp.create(method=method, realm="api.example.com", secret_key="secret")
 
     direct = await server.charge(None, "1.00")
     assert isinstance(direct, Challenge)
@@ -126,6 +126,17 @@ async def test_can_offer_checks_repeated_offers_but_not_direct_handlers_or_redem
     assert not isinstance(paid, ComposedChallenges)
     assert paid[1].reference == "only"
     assert amounts == ["100", "200"]
+
+
+@pytest.mark.asyncio
+async def test_implicit_charge_keeps_composed_result_when_one_method_is_filtered() -> None:
+    first = ThirdPartyMethod("first", can_offer=lambda _request: False)
+    second = ThirdPartyMethod("second", can_offer=lambda _request: True)
+
+    result = await create_server(first, second).charge(None, "1.00")
+
+    assert isinstance(result, ComposedChallenges)
+    assert [challenge.method for challenge in result.challenges] == ["second"]
 
 
 @pytest.mark.asyncio
